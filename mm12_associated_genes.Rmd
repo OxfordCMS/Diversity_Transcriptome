@@ -1,0 +1,320 @@
+---
+title: "Checking differences in MM12 mice"
+output: html_document
+date: "2026-08-16"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Ileum
+
+```{r mm12 associated, echo = FALSE, message = FALSE}
+
+# get metadatas
+ileum_spf_gf_mm12_meta <- metadata[metadata$age == "Young" & 
+                                     metadata$tissue == "ileum" &
+                                     metadata$group == "Solo",]
+liver_spf_gf_mm12_meta <- metadata[metadata$age == "Young" & 
+                                     metadata$tissue == "liver" &
+                                     metadata$group == "Solo",]
+
+# get expression data
+ileum_exprs <- ileum_normed_dat_corrected[,ileum_spf_gf_mm12_meta$sample_id]
+
+# aggregate on symbols
+geneid2genename <- data.frame(gene_id = ileum_res_gf_vs_mm12$gene_id,
+                              gene_name = ileum_res_gf_vs_mm12$gene_name)
+rownames(geneid2genename) <- geneid2genename$gene_id
+to_agg <- geneid2genename[rownames(ileum_exprs),]
+
+ileum_exprs <- aggregate(ileum_exprs, by = list(to_agg$gene_name), FUN = "mean") %>%
+  tibble::column_to_rownames(var = "Group.1")
+
+
+mm12_gf <- subset(ileum_res_gf_vs_mm12, subset = padj < 0.05)
+mm12_spf <- subset(ileum_res_spf_vs_mm12, subset = padj < 0.05)
+
+# take the intersection
+mm12_up <- intersect(rownames(subset(mm12_gf, subset = log2FoldChange > 0)),
+                     rownames(subset(mm12_spf, subset = log2FoldChange < 0)))
+                     
+mm12_down <- intersect(rownames(subset(mm12_gf, subset = log2FoldChange < 0)),
+                     rownames(subset(mm12_spf, subset = log2FoldChange > 0)))
+
+pathways <- fgsea::gmtPathways( "/well/powrie/shared/mm_msigdb/m5.go.v2023.1.Mm.symbols.gmt.txt")
+pathways <- pathways[grep("GOBP_", names(pathways))]
+fgsea_mm12_up <- fgsea::fora(pathways, mm12_up, universe = ileum_res_spf_vs_gf$gene_name)
+
+fgsea_mm12_down <- fgsea::fora(pathways, mm12_down, universe = ileum_res_spf_vs_gf$gene_name)
+
+rownames(ileum_spf_gf_mm12_meta) <- ileum_spf_gf_mm12_meta$sample_id
+featurebox(as.data.frame(ileum_exprs),
+           metadata = ileum_spf_gf_mm12_meta,
+           features = unlist(fgsea_mm12_up[1,]$overlapGenes)[1:6],
+           group_by = "status")  +
+    theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = group_colours) +
+  theme(legend.position = "none")
+ggsave("export.dir/stress_response.pdf", height = 5, width = 7)
+
+
+featurebox(as.data.frame(ileum_exprs),
+           metadata = ileum_spf_gf_mm12_meta,
+           features = unlist(fgsea_mm12_down[1,]$overlapGenes)[1:6],
+           group_by = "status")  +
+    theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = group_colours) +
+  theme(legend.position = "none")
+ggsave("export.dir/cell_cycle.pdf", height = 5, width = 7)
+
+# write out the mm12 only expression for correlations later
+mm12_samples <- metadata$sample_id[metadata$status == "MM12" & metadata$tissue == "ileum"]
+write.table(data.frame(gene = rownames(ileum_exprs), ileum_exprs[,mm12_samples]),
+            file = "export.dir/mm12_ileum_exprs.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+
+```
+
+```{r coherent sets, echo = FALSE, message = FALSE}
+
+stress_response <- c("Hif1a", "Ppp1r15a", "Atf3", "Ddit3")
+cell_cycle <- c("Cdc20", "Cdca2", "Top2a", "Mki67")
+
+gois_mm12 <- c(stress_response, cell_cycle)
+
+for (i in 1:length(gois_mm12)){
+  genename <- gois_mm12[i]
+  filename <- paste0("export.dir/ileum_", genename, "mm12", ".pdf")
+  featurebox(as.data.frame(ileum_exprs),
+           metadata = ileum_spf_gf_mm12_meta,
+           features = gois_mm12[i],
+           group_by = "status")  +
+    theme_classic() +
+    facet_wrap(~feature, scales = "free") +
+    scale_color_manual(values = group_colours) +
+    theme(legend.position = "none")
+    ggsave(file = filename, height = 2.5, width = 2.5)
+}
+
+```
+
+
+## Correlate diffs in GF and SPF
+
+### Ileum
+
+```{r correlation of fold changes, echo = FALSE, message = FALSE}
+
+genes <- intersect(rownames(ileum_res_gf_vs_mm12),
+                   rownames(ileum_res_spf_vs_mm12))
+
+to_cor_fold <- data.frame(gene = genes,
+                          GF = ileum_res_gf_vs_mm12[genes,]$log2FoldChange,
+                          SPF = ileum_res_spf_vs_mm12[genes,]$log2FoldChange)
+
+to_cor_fold$sig <- ifelse(to_cor_fold$gene %in% mm12_up, "up", NA)
+to_cor_fold$sig <- ifelse(to_cor_fold$gene %in% mm12_down, "down", to_cor_fold$sig)
+
+to_cor_fold$label <- ifelse(to_cor_fold$GF > 2 & -to_cor_fold$SPF > 2,
+                            to_cor_fold$gene,
+                            NA)
+
+ggplot(to_cor_fold, aes(x = GF, y = -SPF, color = sig)) +
+  geom_point(size = 0.5) +
+  theme_classic() +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  scale_color_manual(values = c("blue3", "red3"), na.value = "snow2") +
+  theme(legend.position = "none")
+
+ggsave("export.dir/ileum_scatter_mm12_associated.pdf", height = 2.5, width = 2.5)
+
+```
+
+## Liver
+
+```{r mm12 associated liver, echo = FALSE, message = FALSE}
+
+mm12_gf_liver <- subset(liver_res_gf_vs_mm12, subset = padj < 0.05)
+mm12_spf_liver <- subset(liver_res_spf_vs_mm12, subset = padj < 0.05)
+
+# take the intersection
+mm12_liver_up <- intersect(rownames(subset(mm12_gf_liver, subset = log2FoldChange > 0)),
+                     rownames(subset(mm12_spf_liver, subset = log2FoldChange < 0)))
+                     
+mm12_liver_down <- intersect(rownames(subset(mm12_gf_liver, subset = log2FoldChange < 0)),
+                     rownames(subset(mm12_spf_liver, subset = log2FoldChange > 0)))
+
+fgsea_mm12_liver_up <- fgsea::fora(pathways, mm12_liver_up, universe = rownames(liver_res_spf_vs_gf))
+
+fgsea_mm12_liver_down <- fgsea::fora(pathways, mm12_liver_down, universe = rownames(liver_res_spf_vs_gf))
+
+rownames(liver_spf_gf_mm12_meta) <- liver_spf_gf_mm12_meta$sample_id
+featurebox(as.data.frame(liver_exprs),
+           metadata = liver_spf_gf_mm12_meta,
+           features = unlist(fgsea_mm12_liver_up[1,]$overlapGenes)[1:6],
+           group_by = "status")  +
+    theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = liver_colours) +
+  theme(legend.position = "none")
+
+featurebox(as.data.frame(liver_exprs),
+           metadata = liver_spf_gf_mm12_meta,
+           features = unlist(fgsea_mm12_liver_down[1,]$overlapGenes)[1:6],
+           group_by = "status")  +
+    theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = liver_colours)  +
+  theme(legend.position = "none")
+
+mm12_samples_liver <- metadata$sample_id[metadata$status == "MM12" & metadata$tissue == "liver"]
+write.table(data.frame(gene = rownames(liver_exprs), liver_exprs[,mm12_samples_liver]),
+            file = "export.dir/mm12_liver_exprs.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+
+### Liver correlations
+
+```{r correlation of fold changes liver, echo = FALSE, message = FALSE}
+
+genes <- intersect(rownames(liver_res_gf_vs_mm12),
+                   rownames(liver_res_spf_vs_mm12))
+
+to_cor_fold_liver <- data.frame(gene = genes,
+                          GF = liver_res_gf_vs_mm12[genes,]$log2FoldChange,
+                          SPF = liver_res_spf_vs_mm12[genes,]$log2FoldChange)
+
+to_cor_fold_liver$sig <- ifelse(to_cor_fold_liver$gene %in% mm12_liver_up, "up", NA)
+to_cor_fold_liver$sig <- ifelse(to_cor_fold_liver$gene %in% mm12_liver_down, "down", to_cor_fold_liver$sig)
+
+to_cor_fold_liver$label <- ifelse(to_cor_fold_liver$GF > 2 & -to_cor_fold_liver$SPF > 2,
+                            to_cor_fold$gene,
+                            NA)
+
+ggplot(to_cor_fold_liver, aes(x = GF, y = -SPF, color = sig)) +
+  geom_point(size = 0.5) +
+  theme_classic() +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  scale_color_manual(values = c("blue3", "red3"), na.value = "snow2") +
+  ggrepel::geom_text_repel(label = to_cor_fold_liver$label, max.overlaps = 50, color = "black")
+
+```
+
+
+
+
+
+```{r cell cycle, echo = FALSE, message = FALSE}
+
+featurebox(as.data.frame(ileum_exprs),
+           metadata = ileum_spf_gf_mm12_meta,
+           features = c("Cdc20",
+                        "Cdk1",
+                        "Ccnb1",
+                        "Ccna2",
+                        "Plk1",
+                        "Aurkb",
+                        "Nusap1",
+                        "Tpx2",
+                        "Top2a",
+                        "Kif11",
+                        "Kif20a",
+                        "Lamp1",
+                        "Lamp2",
+                        "Mki67",
+                        "Top2a",
+                        "Rab30"),
+           group_by = "status")  +
+    theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = group_colours)  +
+  theme(legend.position = "none")
+
+
+```
+
+
+```{r pathways, echo = FALSE, message = FALSE}
+
+dim(subset(fgsea_mm12_up, subset = padj < 0.05))
+dim(subset(fgsea_mm12_down, subset = padj < 0.05))
+
+dim(subset(fgsea_mm12_liver_up, subset = padj < 0.05))
+dim(subset(fgsea_mm12_liver_down, subset = padj < 0.05))
+
+```
+
+
+
+## Correlations between up and down genes in the ileum
+
+```{r corrs, echo = FALSE, message = FALSE}
+
+to_cor_mm12 <- data.frame(sample = colnames(ileum_exprs),
+                          Ppp1r15a = unlist(ileum_exprs["Ppp1r15a",]),
+                          Hif1a = unlist(ileum_exprs["Hif1a",]),
+                          Vegfa = unlist(ileum_exprs["Vegfa",]),
+                          Cdc20 = unlist(ileum_exprs["Cdc20",]),
+                          Kif22 = unlist(ileum_exprs["Kif22",]),
+                          Lamp1, = unlist(ileum_exprs["Lamp1",]),
+                          status = ileum_metadata_spf_mm12[colnames(ileum_exprs),]$status)
+                          
+
+ggplot(to_cor_mm12, aes(x = Cdc20, y = Kif22, color = status)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  scale_color_manual(values = group_colours) +
+  stat_cor()
+
+
+```
+
+
+
+# write pathway results
+
+
+```{r fora pathway results, echo = FALSE, message = FALSE}
+
+
+fgsea_mm12_up <- fgsea::fora(pathways, mm12_up, universe = ileum_res_spf_vs_gf$gene_name)
+fgsea_mm12_up$type <- "Genes_Upregulated"
+
+fgsea_mm12_down <- fgsea::fora(pathways, mm12_down, universe = ileum_res_spf_vs_gf$gene_name)
+fgsea_mm12_down$type <- "Genes_Downregulated"
+
+fgsea_res_mm12 <- bind_rows(fgsea_mm12_up, fgsea_mm12_down)
+
+fgsea_res_mm12 <- fgsea_res_mm12[fgsea_res_mm12$padj < 0.05,]
+
+for (i in 1:nrow(fgsea_res_mm12)){
+  fgsea_res_mm12[i,]$overlapGenes<- paste(unlist(fgsea_res_mm12[i,]$overlapGenes), collapse = ", ")[[1]]
+}
+fgsea_res_mm12$overlapGenes<- unlist(fgsea_res_mm12$overlapGenes)
+
+write.table(fgsea_res_mm12,
+            file = "export.dir/fora_mm12_distinct.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+
+

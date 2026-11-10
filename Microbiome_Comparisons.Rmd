@@ -1,0 +1,1326 @@
+---
+title: "Diversity analysis"
+output: html_document
+date: "2026-08-15"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+This script takes code from Amit's thesis in order to get a bit of a structured overall figure together to describe differences between MM12 in terms of taxonomy and predicted metabolism. As the ileum is relatively low biomass and low diversity in terms of microbes we should compare them using both diversity metrics as well as species level analysis and predicted metabolites.
+
+
+```{r load libraries, echo = FALSE, message = FALSE}
+
+set.seed(1)
+library(vegan)
+library(tidyverse)
+library(ggplot2)
+library(phyloseq)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(reshape2)
+source("/well/powrie/users/utu691/devel/Diversity_Transcriptome/R/utils.R")
+source("/well/powrie/users/utu691/devel/Diversity_Transcriptome/R/mm12_mapping.R")
+source("/well/powrie/users/utu691/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_plotting.R")
+source("/well/powrie/users/utu691/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_retrieval.R")
+
+```
+
+
+```{r read mm12, echo = FALSE, message = FALSE}
+
+qPCR <- read.csv('/well/powrie/users/cqh100/work/generated_data/qPCR/mm12.csv', header = TRUE, row.names = 1)
+names(qPCR) <- gsub("\\.", " ", names(qPCR))
+qPCR[] <- lapply(qPCR, function(x) as.numeric(as.character(x)))
+
+shannon_values <- vegan::diversity(t(qPCR), index = "shannon")
+df_shannon <- data.frame(
+  sample_id = names(shannon_values),
+  shannon_diversity = shannon_values
+)
+
+ileum_metadata <- read.table(
+  '/well/powrie/users/cqh100/work/mouse_rna_seq/splicing/ileum_metadata_with_PC_correction.tsv',
+  sep = '\t', header = TRUE
+)
+
+colnames(ileum_metadata)[1] <- 'sampleID'
+ileum_metadata <- subset(ileum_metadata, tissue == 'ileum' & age == 'Young' & group == 'Solo')
+rownames(ileum_metadata) <- ileum_metadata$sampleID
+
+# we have one missing sample
+ileum_metadata <- subset(ileum_metadata, rownames(ileum_metadata) != 'Ileum61')
+
+# map samples from qPCR
+ileum_metadata_mm12 <- subset(ileum_metadata, status == 'MM12')
+ileum_metadata_mm12$Sample <- paste("Sample", seq(1, nrow(ileum_metadata_mm12)))
+
+idmap <- data.frame(sample = ileum_metadata_mm12$Sample,
+                    sample_id = ileum_metadata_mm12$sampleID)
+rownames(idmap) <- idmap$sample
+
+df_shannon$sample_id <- idmap[df_shannon$sample,]$sample_id
+
+# get rid of germ free at this point
+ileum_metadata_spf_mm12 <- subset(ileum_metadata, subset = status != "GF")
+
+spf_samples <- ileum_metadata_spf_mm12$sampleID[ileum_metadata_spf_mm12$status == "SPF"]
+
+```
+
+
+```{r read spf, echo = FALSE, message = FALSE}
+
+counts <- read.table('/well/powrie/users/cqh100/work/metagenomics/run4/counts.dir/species_counts.tsv', sep = '\t', header = TRUE, quote = "", fill = TRUE)
+colnames(counts) <- gsub('_masked\\.abundance', '', x = colnames(counts))
+colnames(counts) <- gsub('^A', 'Ileum', x = colnames(counts))
+counts_table <- as.data.frame(lapply(counts[-1], as.numeric))
+counts$taxon <- make.unique(as.character(counts$taxon))
+row.names(counts) <- counts$taxon
+counts <- counts[, -which(names(counts) == "taxon")]
+row.names(counts_table) <- row.names(counts)
+colnames(counts_table) <- gsub('01', '1', x = colnames(counts_table))
+colnames(counts_table) <- gsub('02', '2', x = colnames(counts_table))
+colnames(counts_table) <- gsub('03', '3', x = colnames(counts_table))
+colnames(counts_table) <- gsub('04', '4', x = colnames(counts_table))
+colnames(counts_table) <- gsub('05', '5', x = colnames(counts_table))
+colnames(counts_table) <- gsub('06', '6', x = colnames(counts_table))
+colnames(counts_table) <- gsub('07', '7', x = colnames(counts_table))
+colnames(counts_table) <- gsub('08', '8', x = colnames(counts_table))
+colnames(counts_table) <- gsub('09', '9', x = colnames(counts_table))
+counts_table_no_controls <- counts_table[, !grepl("Ileum(61|62|63|64|65)$", colnames(counts_table))]
+
+```
+
+```{r split taxonomy function, echo = FALSE, message = FALSE}
+
+tax <- split_taxonomy(counts_table_no_controls)
+
+# filter out human annotations and take relative abundances
+species <- tax$species[rownames(tax$species) != "Homo_sapiens",]
+
+# Calculate Shannon before filtering
+shannon_spf <- vegan::diversity(t(species), index = "shannon")
+df_shannon_spf <- data.frame(
+  sample_id = names(shannon_spf),
+  shannon_diversity = shannon_spf
+)
+
+all_shannon <- bind_rows(df_shannon, df_shannon_spf)
+rownames(all_shannon) <- all_shannon$sample_id
+
+# add to metadata
+ileum_metadata_spf_mm12$shannon <- all_shannon[ileum_metadata_spf_mm12$sampleID,]$shannon_diversity 
+
+micro_colors <- c("#3288BD", "#5E4FA2")
+names(micro_colors) <- c("MM12", "SPF")
+
+# Plot the alpha diversity
+ggplot(ileum_metadata_spf_mm12, aes(x = status, y = shannon, color = status)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = micro_colors) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2)))
+
+ggsave("export.dir/alpha_diversity_comparison.pdf", height = 2.5, width = 2.5)
+
+```
+
+
+## Beta diversity
+
+I think it is useful just to see the distance between SPF and MM12 - obviously they are going to be different but may have some utility.
+
+```{r beta div, echo = FALSE, message = FALSE}
+
+# sort out MM12
+mm12_relab <- qPCR
+colnames(mm12_relab) <- idmap[colnames(mm12_relab),]$sample_id
+rownames(mm12_relab) <- gsub(" ", "_", strain_mapping[rownames(mm12_relab)])
+
+spftomm12 <- rownames(mm12_relab)
+names(spftomm12) <- c("[Clostridium]_innocuum",
+                      "Bacteroides_caecimuris",
+                      "Limosilactobacillus_reuteri",
+                      "Enterococcus_faecalis",
+                      "Acutalibacter_muris",
+                      "Bifidobacterium_animalis",
+                      "Muribaculum_intestinale",
+                      "Flavonifractor_plautii",
+                      "Enterocloster_clostridioformis",
+                      "Turicimonas_muris",
+                      "Blautia_pseudococcoides",
+                      "Akkermansia_muciniphila")
+```
+
+```{r spf relab, echo = FALSE, message = FALSE}
+
+# filter as Amit did previously
+filtered_results_phylum <- filter_feature(tax$phylum, filter_method = 'percent_sample', 
+                                         cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+filtered_results_class <- filter_feature(tax$class, filter_method = 'percent_sample', 
+                                        cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+filtered_results_order <- filter_feature(tax$order, filter_method = 'percent_sample', 
+                                        cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+filtered_results_family <- filter_feature(tax$family, filter_method = 'percent_sample', 
+                                         cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+filtered_results_genus <- filter_feature(tax$genus, filter_method = 'percent_sample', 
+                                        cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+filtered_results_species <- filter_feature(tax$species, filter_method = 'percent_sample', 
+                                          cutoff = 0.001, prev_cutoff = 3, data_type = 'metagenomics')
+
+
+```
+
+```{r mm12 all levels, echo = FALSE, message = FALSE}
+
+mm12_phylum <- mm12_relab
+phyla <- phylum_mapping[rownames(mm12_phylum)]
+mm12_phylum <- aggregate(mm12_phylum, by = list(phyla), FUN = "sum") %>%
+  column_to_rownames("Group.1")
+
+mm12_class <- mm12_relab
+classes <- class_mapping[rownames(mm12_class)]
+mm12_class <- aggregate(mm12_class, by = list(classes), FUN = "sum") %>%
+  column_to_rownames("Group.1")
+
+mm12_order <- mm12_relab
+orders <- order_mapping[rownames(mm12_order)]
+mm12_order <- aggregate(mm12_order, by = list(orders), FUN = "sum") %>%
+  column_to_rownames("Group.1")
+
+mm12_family <- mm12_relab
+families <- family_mapping[rownames(mm12_family)]
+mm12_family <- aggregate(mm12_family, by = list(families), FUN = "sum") %>%
+  column_to_rownames("Group.1")
+
+mm12_genus <- mm12_relab
+genera <- genus_mapping[rownames(mm12_genus)]
+mm12_genus <- aggregate(mm12_genus, by = list(genera), FUN = "sum") %>%
+  column_to_rownames("Group.1")
+
+mm12_species <- mm12_relab
+
+```
+
+```{r sort spf names, echo = FALSE, message = FALSE}
+
+phylum_counts <- filtered_results_phylum$filtered[,spf_samples]
+class_counts <- filtered_results_class$filtered[,spf_samples]
+order_counts <- filtered_results_order$filtered[,spf_samples]
+family_counts <- filtered_results_family$filtered[,spf_samples]
+genus_counts <- filtered_results_genus$filtered[,spf_samples]
+species_counts <- filtered_results_species$filtered[,spf_samples]
+
+rownames(species_counts) <- ifelse(rownames(species_counts) %in% names(spftomm12),
+                                   spftomm12[rownames(species_counts)], rownames(species_counts))
+
+
+```
+
+```{r merge mm12 and spf, echo = FALSE, message = FALSE}
+
+phylum_relab <- relab(phylum_counts)
+phylum_merged <- merge(phylum_relab,
+                       mm12_phylum,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+phylum_merged <- phylum_merged[rownames(phylum_merged) != "Chordata",]
+  
+
+class_relab <- relab(class_counts)
+class_merged <- merge(class_relab,
+                       mm12_class,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+class_merged <- class_merged[rownames(class_merged) != "Mammalia",]
+
+order_relab <- relab(order_counts)
+order_merged <- merge(order_relab,
+                       mm12_order,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+order_merged <- order_merged[rownames(order_merged) != "Primates",]
+
+family_relab <- relab(family_counts)
+family_merged <- merge(family_relab,
+                       mm12_family,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+family_merged <- family_merged[rownames(family_merged) != "Hominidae",]
+
+genus_relab <- relab(genus_counts)
+genus_merged <- merge(genus_relab,
+                       mm12_genus,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+genus_merged <- genus_merged[rownames(genus_merged) != "Homo",]
+
+species_relab <- relab(species_counts)
+species_merged <- merge(species_relab,
+                       mm12_species,
+                       by.x = "row.names",
+                       by.y = "row.names",
+                       all.x = TRUE,
+                       all.y = TRUE) %>%
+  column_to_rownames("Row.names")
+species_merged <- species_merged[rownames(species_merged) != "Homo_sapiens",]
+
+phylum_merged[is.na(phylum_merged)] <- 0
+class_merged[is.na(class_merged)] <- 0
+order_merged[is.na(order_merged)] <- 0
+family_merged[is.na(family_merged)] <- 0
+genus_merged[is.na(genus_merged)] <- 0
+species_merged[is.na(species_merged)] <- 0
+
+# write out the species-level relative abundances
+## SPF
+write.table(data.frame(species = rownames(species_relab), species_relab),
+                       file = "export.dir/spf_species_relab.tsv",
+                       sep = "\t",
+                       row.names = FALSE,
+                       quote = FALSE)
+
+## MM12
+write.table(data.frame(species = rownames(mm12_relab), mm12_relab),
+                       file = "export.dir/mm12_species_relab.tsv",
+                       sep = "\t",
+                       row.names = FALSE,
+                       quote = FALSE)
+
+```
+
+```{r PCoAs, echo = FALSE, message = FALSE}
+
+sample_table <- phyloseq::sample_data(ileum_metadata_spf_mm12[colnames(phylum_merged),])
+
+phylum_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(phylum_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+phylum_ord <- ordinate(phylum_obj, method = "PCoA")
+phylum_plt <- plot_ordination(phylum_obj, phylum_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+class_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(class_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+class_ord <- ordinate(class_obj, method = "PCoA")
+class_plt <- plot_ordination(class_obj, class_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+order_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(order_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+order_ord <- ordinate(order_obj, method = "PCoA")
+order_plt <- plot_ordination(order_obj, order_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+family_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(family_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+family_ord <- ordinate(family_obj, method = "PCoA")
+family_plt <- plot_ordination(family_obj, order_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+genus_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(genus_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+genus_ord <- ordinate(genus_obj, method = "PCoA")
+genus_plt <- plot_ordination(genus_obj, order_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+species_obj <- phyloseq::merge_phyloseq(phyloseq::otu_table(species_merged, taxa_are_rows  = TRUE),
+                                       sample_table)
+species_ord <- ordinate(species_obj, method = "PCoA")
+species_plt <- plot_ordination(species_obj, order_ord, color = "status") +
+  scale_color_manual(values = group_colours) +
+  theme_classic() +
+  stat_ellipse()
+
+gridExtra::grid.arrange(phylum_plt, class_plt, order_plt, family_plt, genus_plt, species_plt, nrow = 3)
+
+ggsave(species_plt + theme(legend.position = "none"), file = "export.dir/species_ordination_mm12_spf.pdf", height = 2.5, width = 2.5)
+
+```
+
+```{r compostion plots, echo = FALSE, message = FALSE}
+
+## need to make my own colors to accentuate the lactobacilli
+species_colors <- OCMSutility::get_palette(n = nrow(species_merged))
+names(species_colors) <- rownames(species_merged)
+
+lactos <- unique(rownames(species_merged[grep("bacillus", rownames(species_merged)),]))
+bluesy <- c()
+set.seed(200)
+for (i in 1:length(species_colors)){
+  if (names(species_colors)[i] %in% lactos){
+    newcol <- sample(blues9[!blues9 %in% bluesy], 1)
+    species_colors[names(species_colors)[i]] <- newcol
+  }
+}
+
+# family colors
+family_colors <- OCMSutility::get_palette(n = 100)[c(1:10, 20:40)]
+names(family_colors) <- rownames(family_merged)
+family_colors[names(family_colors) == "Lactobacillaceae"] <- blues9[7]
+family_colors[names(family_colors) == "Akkermansiaceae"] <- "#BEAED4"
+family_colors[names(family_colors) == "Bacteroidaceae"] <-  "#7FC97F"
+
+phylum_colors <- OCMSutility::get_palette(n = nrow(phylum_merged))
+names(phylum_colors) <- rownames(phylum_merged)
+phylum_colors[names(phylum_colors) == "Bacillota"] <- blues9[7]
+                   
+stacked_bar_phylum <- OCMSutility::stacked_barchart(phylum_merged)
+phylum_dat <- stacked_bar_phylum$data
+phylum_dat$status <- ileum_metadata_spf_mm12[as.character(phylum_dat$Sample),]$status
+
+
+stacked_bar_family <- OCMSutility::stacked_barchart(family_merged, top_n = nrow(family_merged))
+family_dat <- stacked_bar_family$data
+family_dat$status <- ileum_metadata_spf_mm12[as.character(family_dat$Sample),]$status
+
+sample_order <- family_dat[family_dat$Taxon == "Lactobacillaceae",]
+sample_order <- sample_order[order(sample_order$Relab, decreasing = TRUE),]$Sample
+family_dat$Sample <- factor(family_dat$Sample, levels = sample_order)
+
+fam_stacked <- ggplot(family_dat, aes(x = Sample, y = Relab, fill = Taxon)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~status, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = family_colors)
+
+stacked_bar_species <- OCMSutility::stacked_barchart(species_merged, top_n = 49)
+species_dat <- stacked_bar_species$data
+species_dat$status <- ileum_metadata_spf_mm12[as.character(species_dat$Sample),]$status
+species_dat$cage <- ileum_metadata_spf_mm12[as.character(species_dat$Sample),]$cage
+
+#sample_order <- species_dat[species_dat$Taxon == "Limosilactobacillus_reuteri",]
+#sample_order <- sample_order[order(sample_order$Relab, decreasing = TRUE),]$Sample
+
+species_dat$Sample <- factor(species_dat$Sample, levels = sample_order)
+sp_stacked <- ggplot(species_dat, aes(x = Sample, y = Relab, fill = Taxon)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~status, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = species_colors)
+
+phylum_dat$Sample <- factor(phylum_dat$Sample, levels = sample_order)
+phy_stacked <- ggplot(phylum_dat, aes(x = Sample, y = Relab, fill = Taxon)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~status, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = phylum_colors)
+
+sp_stacked_cage <- ggplot(species_dat, aes(x = Sample, y = Relab, fill = Taxon)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~cage + status, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = species_colors)
+
+phy_stacked 
+fam_stacked 
+sp_stacked 
+
+ggsave(phy_stacked, file = "export.dir/phylum_stacked_leg.pdf", height = 2.5, width = 5)
+ggsave(fam_stacked, file = "export.dir/fam_stacked_leg.pdf", height = 2.5, width = 5)
+ggsave(sp_stacked, file = "export.dir/sp_stacked_leg.pdf", height = 2.5, width = 5)
+
+ggsave(phy_stacked + theme(legend.position = "none"),
+       file = "export.dir/phylum_stacked.pdf",
+       height = 2.5,
+       width = 10)
+
+ggsave(fam_stacked + theme(legend.position = "none"),
+       file = "export.dir/family_stacked.pdf",
+       height = 2.5,
+       width = 10)
+
+ggsave(sp_stacked + theme(legend.position = "none"),
+       file = "export.dir/species_stacked.pdf",
+       height = 2.5,
+       width = 10)
+
+```
+
+## Venn of species
+
+```{r species venn, echo = FALSE, message = FALSE}
+
+species_venn <- list(SPF = rownames(species_relab),
+                     MM12 = rownames(mm12_relab))
+
+v_species <- VennDiagram::venn.diagram(species_venn,
+                                        filename = NULL,
+                                        fill = c("#5E4FA2", "#3288BD"))
+
+pdf("export.dir/spf_mm12_species.pdf", height = 2.5, width = 2.5)
+grid.draw(v_species)
+dev.off()
+
+```
+
+
+```{r diffs in akkermansia, echo = FALSE, message = FALSE}
+
+akker_spf <- data.frame(sample = colnames(species_relab),
+                        Akkermansia_muciniphila = unlist(species_relab["Akkermansia_muciniphila",]),
+                        type = "SPF")
+
+akker_mm12 <- data.frame(sample = colnames(mm12_relab),
+                        Akkermansia_muciniphila = unlist(mm12_relab["Akkermansia_muciniphila",]),
+                        type = "MM12")
+
+
+akkermansia_muciniphila <- bind_rows(akker_spf, akker_mm12)
+
+ggplot(akkermansia_muciniphila, aes(x = type, y = Akkermansia_muciniphila, color = type)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2))) +
+  theme(legend.position = "none")
+
+ggsave("export.dir/Akkermansia_mm12_spf.pdf", height = 2.5, width = 2.5)
+
+```
+
+# Predicted metabolites
+
+## Main questions to tackle
+
+1) What are the differences in metabolite production fluxes between MM12 and SPF.
+2) Do the major producers differ between MM12 and SPF for some of the common meetabolites.
+2) What are the correlations between production rate and exchange fluxes.
+3) Which "metabolic niches" are present in MM12 and SPF and what imports dominate 
+these niches
+4) How do dominant bacteria i.e. Lactobacilli vary in export fluxes based on the community composition i.e. minimal vs. SPF.
+
+
+```{r read mm12 flux, echo = FALSE, message = FALSE}
+
+# Read and process data
+net_flux_rates_mm12 <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/mm12_invivo/net_fluxes_export_only.csv', sep = ",", header = TRUE, row.names = 1)
+
+expanded_fluxes_mm12 <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/mm12_invivo/expanded_fluxes.csv', sep = ",", header = TRUE, row.names = 1)
+
+
+net_flux_rates_spf <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/spf/repeat/net_fluxes.csv', sep = ",", header = TRUE, row.names = 1)
+
+expanded_fluxes_spf <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/spf/repeat/expanded_fluxes.csv', sep = ",", header = TRUE, row.names = 1)
+
+```
+
+
+```{r metabolite comparison, echo = FALSE, message = FALSE}
+
+# Load and clean data
+spf_ileum_samples <-paste0("Ileum", 1:15)
+problematic_metabolites <- c("olsa", "peamn", "sanilamide", "tln", "xtsn", "ppoh", "glyclt", "pront")
+
+strip_compartment <- function(x) gsub("\\[.\\]$|_[a-z]$", "", x)
+
+spf_flux_rates <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/spf/repeat/flux_rates.csv', row.names = 1) %>%
+  filter(sample_id %in% spf_ileum_samples, !metabolite %in% problematic_metabolites) %>%
+  filter(type == "export") %>%  # ONLY EXPORT (PRODUCTION) FLUXES
+  mutate(metabolite = strip_compartment(metabolite))
+
+spf_net_fluxes <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/spf/repeat/net_fluxes.csv', row.names = 1) %>%
+  filter(sample_id %in% spf_ileum_samples, !metabolite %in% problematic_metabolites) %>%
+  filter(net_flux > 0) %>%  # ONLY POSITIVE NET FLUX (PRODUCTION)
+  mutate(metabolite = strip_compartment(metabolite))
+
+sample_mapping <- setNames(paste0("Ileum", sprintf("%02d", 62:75)), paste0("Sample ", 1:14))
+
+mm12_flux_rates <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/mm12_invivo/flux_rates.csv', row.names = 1) %>%
+  filter(sample_id %in% names(sample_mapping), !metabolite %in% problematic_metabolites) %>%
+  filter(type == "export") %>%  # ONLY EXPORT (PRODUCTION) FLUXES
+  mutate(sample_id = sample_mapping[sample_id], metabolite = strip_compartment(metabolite))
+
+mm12_net_fluxes <- read.csv('/well/powrie/users/cqh100/work/generated_data/micom/mm12_invivo/net_fluxes.csv', row.names = 1) %>%
+  filter(sample_id %in% names(sample_mapping), !metabolite %in% problematic_metabolites) %>%
+  filter(net_flux > 0) %>%  # ONLY POSITIVE NET FLUX (PRODUCTION)
+  mutate(sample_id = sample_mapping[sample_id], metabolite = strip_compartment(metabolite))
+
+# Apply prevalence-abundance filter (flux >= 0.0001 in >= 3 samples)
+filter_data <- function(data, flux_col) {
+  qualifying_metabolites <- data %>%
+    filter(!!sym(flux_col) >= 0.0001) %>%
+    group_by(metabolite) %>%
+    summarise(sample_count = n_distinct(sample_id), .groups = 'drop') %>%
+    filter(sample_count >= 3) %>%
+    pull(metabolite)
+  
+  data %>% filter(metabolite %in% qualifying_metabolites, !!sym(flux_col) >= 0.0001)
+}
+
+#spf_flux_filtered <- filter_data(spf_flux_rates, "flux")
+#spf_net_filtered <- filter_data(spf_net_fluxes, "net_flux")
+#mm12_net_filtered <- filter_data(mm12_net_fluxes, "net_flux")
+#mm12_flux_filtered <- filter_data(mm12_flux_rates, "flux")
+
+# What does it look like with no filtering
+spf_flux_filtered <- spf_flux_rates
+spf_net_filtered <- spf_net_fluxes
+mm12_flux_filtered <- mm12_flux_rates
+mm12_net_filtered <- mm12_net_fluxes
+
+
+spf_export <- spf_flux_filtered %>%
+  dplyr::select(sample_id, metabolite, gross_flux = flux, name, molecular_weight) %>%
+  mutate(condition = "SPF") %>%
+  tidyr::complete(sample_id, metabolite, fill = list(gross_flux = 0)) %>%
+  group_by(metabolite) %>%
+  tidyr::fill(name, molecular_weight, condition, .direction = "downup") %>%
+  ungroup()
+
+mm12_export <- mm12_flux_filtered %>%
+  dplyr::select(sample_id, metabolite, gross_flux = flux, name, molecular_weight) %>%
+  mutate(condition = "MM12") %>%
+  tidyr::complete(sample_id, metabolite, fill = list(gross_flux = 0)) %>%
+  group_by(metabolite) %>%
+  tidyr::fill(name, molecular_weight, condition, .direction = "downup") %>%
+  ungroup()
+
+# Get metabolite overlaps
+spf_metabolites <- unique(spf_export$metabolite)
+mm12_metabolites <- unique(mm12_export$metabolite)
+common_metabolites <- intersect(spf_metabolites, mm12_metabolites)
+
+# 1. VENN DIAGRAM
+venn_data <- list(
+  "SPF" = spf_metabolites,
+  "MM12" = mm12_metabolites
+)
+
+v_spf_mm12 <- VennDiagram::venn.diagram(venn_data,
+                                        filename = NULL,
+                                        fill = c("#5E4FA2", "#3288BD"))
+
+pdf("export.dir/spf_mm12_mets_nofilter.pdf", height = 2.5, width = 2.5)
+grid.draw(v_spf_mm12)
+dev.off()
+
+```
+
+## Pathway associations - taking out inorganic ions and minerals
+
+```{r pathway associations removed, echo = FALSE, message = FALSE}
+
+# not biologically useful to interpret
+remove_minerals <- c("calcium",
+                 "Zinc",
+                 "Sodium",
+                 "magnesium",
+                 "Chloride",
+                 "potassium",
+                 "Lead",
+                 "Nickel",
+                 "Molybdate",
+                 "Mn2+",
+                 "Hg2+",
+                 "Fe2+",
+                 "Fe3+")
+
+
+unwanted_metabolites <- c("h2", "nh4", spf_export$metabolite[spf_export$name %in%
+                                                c("O2",
+                                                  "Carbon dioxide",
+                                                  "proton",
+                                                  "Water",
+                                                  remove_minerals)])
+unwanted_metabolites <- unique(unwanted_metabolites)
+
+spf_wide <- data.frame(metabolite = spf_export$metabolite,
+                       sample = spf_export$sample_id,
+                       flux = spf_export$gross_flux) %>%
+  subset(subset = !metabolite %in% unwanted_metabolites) %>%
+  pivot_wider(names_from = sample, values_from = flux) %>%
+  column_to_rownames("metabolite")
+
+mm12_wide <- data.frame(metabolite = mm12_export$metabolite,
+                       sample = mm12_export$sample_id,
+                       flux = mm12_export$gross_flux) %>%
+  subset(subset = !metabolite %in% unwanted_metabolites) %>%
+  pivot_wider(names_from = sample, values_from = flux) %>%
+  column_to_rownames("metabolite")
+
+## MM12 missing compounds - is there an enrichment of
+# certain compunds that are missing from the MM12?
+met2kegg <- spf_flux_filtered$kegg.compound
+names(met2kegg) <- spf_flux_filtered$metabolite
+mm12_missing <- setdiff(rownames(spf_wide), rownames(mm12_wide))
+mm12_missing_kegg <- unique(met2kegg[mm12_missing])
+
+kegg_cache_dir <- "/well/powrie/users/cqh100/devel/kegg_databases/"
+
+# Load the KEGG databases
+ko_pathways <- read.csv(file.path(kegg_cache_dir, "kegg_ko_pathways.csv"), row.names = 1)
+compounds <- read.csv(file.path(kegg_cache_dir, "kegg_compounds.csv"), row.names = 1)
+compound_pathway_db <- read.csv(file.path(kegg_cache_dir, "processed_compound_pathway_db.csv"))
+
+# make pathays comptible with fgsea::fora
+compound_pathways <- c()
+for (i in 1:nrow(compound_pathway_db)){
+  pathway <- gsub("path:map", "ko", compound_pathway_db[i,]$pathway)
+  compound <- gsub("cpd:", "", compound_pathway_db[i,]$compound)
+  compound_pathways[[pathway]] <- append(compound_pathways[[pathway]], compound)
+}
+
+fora_results <- fgsea::fora(pathways = compound_pathways,
+                            mm12_missing_kegg,
+                            universe = net_flux_rates_spf$kegg.compound)
+
+pathway2description <- ko_pathways$x
+names(pathway2description) <- rownames(ko_pathways)
+fora_results$description <- pathway2description[fora_results$pathway]
+
+kegg2name <- net_flux_rates_spf$name
+names(kegg2name) <- net_flux_rates_spf$kegg.compound
+abc_transporter_compounds <- kegg2name[unlist(fora_results[1,]$overlapGenes)]
+
+
+overlapping_set <- intersect(rownames(spf_wide), rownames(mm12_wide))
+overlapping_set_kegg <- mm12_missing_kegg <- unique(met2kegg[overlapping_set])
+
+fora_results_overlap <- fgsea::fora(pathways = compound_pathways,
+                            overlapping_set_kegg,
+                            universe = net_flux_rates_spf$kegg.compound)
+
+fora_results_overlap$description <- pathway2description[fora_results_overlap$pathway]
+
+pyruvate_compounds <- kegg2name[unlist(fora_results_overlap[1,]$overlapGenes)]
+
+```
+
+
+## Conserved core
+
+We see a conserved core of carbohydrate fermentation i.e pyruvate metabolism. We can test differences in flux between compounds in these pathways depending on microbiome status.
+
+
+## Pathway associations (keeping in minerals etc)
+
+```{r pathway associations, echo = FALSE, message = FALSE}
+
+## MM12 missing compounds - is there an enrichment of
+# certain compunds that are missing from the MM12?
+met2kegg <- spf_flux_filtered$kegg.compound
+names(met2kegg) <- spf_flux_filtered$metabolite
+mm12_missing <- setdiff(rownames(spf_wide), rownames(mm12_wide))
+mm12_missing_kegg <- unique(met2kegg[mm12_missing])
+
+kegg_cache_dir <- "/well/powrie/users/cqh100/devel/kegg_databases/"
+
+# Load the KEGG databases
+ko_pathways <- read.csv(file.path(kegg_cache_dir, "kegg_ko_pathways.csv"), row.names = 1)
+compounds <- read.csv(file.path(kegg_cache_dir, "kegg_compounds.csv"), row.names = 1)
+compound_pathway_db <- read.csv(file.path(kegg_cache_dir, "processed_compound_pathway_db.csv"))
+
+# make pathays comptible with fgsea::fora
+compound_pathways <- c()
+for (i in 1:nrow(compound_pathway_db)){
+  pathway <- gsub("path:map", "ko", compound_pathway_db[i,]$pathway)
+  compound <- gsub("cpd:", "", compound_pathway_db[i,]$compound)
+  compound_pathways[[pathway]] <- append(compound_pathways[[pathway]], compound)
+}
+
+fora_results <- fgsea::fora(pathways = compound_pathways,
+                            mm12_missing_kegg,
+                            universe = net_flux_rates_spf$kegg.compound)
+
+pathway2description <- ko_pathways$x
+names(pathway2description) <- rownames(ko_pathways)
+fora_results$description <- pathway2description[fora_results$pathway]
+
+kegg2name <- net_flux_rates_spf$name
+names(kegg2name) <- net_flux_rates_spf$kegg.compound
+abc_transporter_compounds <- kegg2name[unlist(fora_results[1,]$overlapGenes)]
+mineral_absorption_compounds <- kegg2name[unlist(fora_results[2,]$overlapGenes)]
+
+```
+
+
+
+
+```{r pyruvate metabolism, echo = FALSE, message = FALSE}
+
+all_fluxes <- merge(spf_wide,
+                    mm12_wide,
+                    by.x = "row.names",
+                    by.y = "row.names") %>%
+  column_to_rownames("Row.names")
+
+meta_statuses <- data.frame(sample = colnames(all_fluxes),
+                            status = c(rep("SPF", 15), rep("MM12", 14)))
+rownames(meta_statuses) <- meta_statuses$sample
+
+pyr <- c("lac_D", "lac_L", "succ", "for", "ac")
+
+pyr_plots <- list()
+for (i in pyr){
+  p <- OCMSutility::featurebox(all_fluxes,
+                          meta_statuses,
+                          features = i,
+                          group_by = "status") +
+    facet_wrap(~feature, scales = "free") +
+    scale_color_manual(values = group_colours) +
+    scale_y_log10() +
+    theme_classic() +
+    ggpubr::stat_compare_means(comparisons = list(c(1,2))) +
+    theme(legend.position = "none")
+  pyr_plots[[i]] <- p
+  filename <- paste0("export.dir/", i, ".pdf")
+  ggsave(filename, height = 2.5, width = 2.5)
+}  
+
+grid.arrange(grobs = pyr_plots) 
+  
+```
+
+
+## Which bacteria contribute to flux of Succinate, Formate and Acetate
+
+```{r echo = FALSE, message = FALSE}
+
+mois <- c("for", "ac", "succ")
+
+expanded_fluxes_spf <- expanded_fluxes_spf[expanded_fluxes_spf$sample_id %in% spf_samples,]
+
+spf_mois <- subset(expanded_fluxes_spf, subset = base_metabolite %in% mois) %>%
+  subset(subset = flux_type == "export") %>%
+  subset(subset = source_organism != "medium")
+
+spf_mois <- spf_mois[order(spf_mois$organism_flux, decreasing = TRUE),]
+spf_mois$sample_id <- factor(spf_mois$sample_id, levels = unique(spf_mois$sample_id))
+ggplot(spf_mois, aes(x = sample_id, y = organism_flux, fill = source_organism)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_manual(values = species_colors) +
+  facet_wrap(~base_metabolite, scales = "free", nrow = 1) +
+  theme(legend.position = "none")
+ggsave("export.dir/spf_pyruvate_mets.pdf", width = 5, height = 2.5)
+
+mm12_mois <- subset(expanded_fluxes_mm12, subset = base_metabolite %in% mois) %>%
+  subset(subset = flux_type == "export") %>%
+  subset(subset = source_organism != "medium")
+
+mm12_mois <- mm12_mois[order(mm12_mois$organism_flux, decreasing = TRUE),]
+mm12_mois$sample_id <- factor(mm12_mois$sample_id, levels = unique(mm12_mois$sample_id))
+mm12_mois$source_organism <-gsub("(.*)_", "", mm12_mois$source_organism)
+mm12_mois$source_organism <- strain_mapping[mm12_mois$source_organism]
+ggplot(mm12_mois, aes(x = sample_id, y = organism_flux, fill = source_organism)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_manual(values = species_colors) +
+  facet_wrap(~base_metabolite, scales = "free", nrow = 1) +
+  theme(legend.position = "none")
+ggsave("export.dir/mm12_pyruvate_mets.pdf", width = 5, height = 2.5)
+
+```
+
+
+
+
+```{r flux comparison, echo = FALSE, message = FALSE}
+
+# plot the most abundant metabolites
+spf_export_top10 <- data.frame(metabolite = rownames(spf_wide),
+                               flux = rowMeans(spf_wide))
+spf_export_top10 <- spf_export_top10[order(spf_export_top10$flux, decreasing = TRUE),][1:10,]
+
+mm12_export_top10 <- data.frame(metabolite = rownames(mm12_wide),
+                               flux = rowMeans(mm12_wide))
+mm12_export_top10 <- mm12_export_top10[order(mm12_export_top10$flux, decreasing = TRUE),][1:10,]
+
+# SPF plot
+
+met2name <- spf_export$name
+names(met2name) <- spf_export$metabolite
+
+spf_export_top10$metabolite <- factor(spf_export_top10$metabolite, levels = spf_export_top10$metabolite)
+ggplot(spf_export_top10, aes(x = metabolite, y = flux)) +
+  geom_bar(stat = "identity", fill = "#5E4FA2") +
+  theme_classic()
+met2name[as.character(spf_export_top10$metabolite)]
+
+mm12_export_top10$metabolite <- factor(mm12_export_top10$metabolite, levels = mm12_export_top10$metabolite)
+ggplot(mm12_export_top10, aes(x = metabolite, y = flux)) +
+  geom_bar(stat = "identity", fill = "#3288BD") +
+  theme_classic()
+met2name[as.character(mm12_export_top10$metabolite)]
+
+
+```
+
+
+## PCAs
+
+```{r pcas, echo = FALSE, message = FALSE}
+
+pcs_all <- runPCA(log10(all_fluxes + min(all_fluxes[all_fluxes != 0])))
+plotPrincipleComponents(pcs_all,
+                        metadata = meta_statuses,
+                        colourby = "status",
+                        group = "status") +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_ellipse() +
+  theme(legend.position = "none")
+
+ggsave("export.dir/metabolite_pca.pdf", height = 2.5, width = 2.5)
+
+```
+
+## Niche occupancy
+
+It is interesting that Akkermansia for example produces a lot of acetate and is high abundance in the ileum of MM12 mice but not in SPF. The next question therefore is it being outcompeted in the SPF. To answer this we can look at shared niches i.e. bacteria that share import fluxes with Akkermansia in the SPF but are missing from the MM12.
+
+```{r niche occupancy, echo = FALSE, message = FALSE}
+
+species_relab <- species_relab[rownames(species_relab) != "Homo_sapiens",]
+
+spf_abundances <- data.frame(species = rownames(species_relab),
+                         abundance = rowMeans(species_relab))
+
+
+# get rid of unwanted metabolits
+expanded_fluxes_mm12 <- subset(expanded_fluxes_mm12,
+                               subset = !base_metabolite %in% unwanted_metabolites)
+expanded_fluxes_spf <- subset(expanded_fluxes_spf,
+                               subset = !base_metabolite %in% unwanted_metabolites)
+
+
+# create matrices for each species-sample pair and then the flux as rows
+mm12_imports <- subset(expanded_fluxes_mm12, subset = flux_type == "import") %>%
+  subset(subset = source_organism != "medium")
+
+strain <- gsub(".*_", "", mm12_imports$source_organism)
+species <- strain_mapping[strain]
+mm12_niches <- data.frame(sample_species = paste0(mm12_imports$sample_id,
+                                                  ":",
+                                                  species),
+                          flux = mm12_imports$organism_flux,
+                          metabolite = mm12_imports$base_metabolite) %>%
+  pivot_wider(names_from = sample_species, values_from = flux) %>%
+  column_to_rownames("metabolite")
+
+
+# SPF
+spf_imports <- subset(expanded_fluxes_spf, subset = flux_type == "import") %>%
+  subset(subset = source_organism != "medium") 
+
+spf_niches <- data.frame(sample_species = paste0(spf_imports$sample_id,
+                                                  ":",
+                                                  spf_imports$source_organism),
+                          flux = spf_imports$organism_flux,
+                          metabolite = spf_imports$base_metabolite) %>%
+  pivot_wider(names_from = sample_species, values_from = flux) %>%
+  column_to_rownames("metabolite")
+
+# Make NAs zeros
+mm12_niches[is.na(mm12_niches)] <- 0
+spf_niches[is.na(spf_niches)] <- 0
+
+# log10 the matrices - make them positive now. I don't think
+# this should change the inferences
+mm12_niches <- mm12_niches * -1
+spf_niches <- spf_niches * -1
+
+mm12_niches <- log10(mm12_niches + min(mm12_niches[mm12_niches != 0]))
+spf_niches <- log10(spf_niches + min(spf_niches[spf_niches != 0]))
+
+meta_mm12_niches <- data.frame(sample = colnames(mm12_niches),
+                               species = gsub(".*:", "", colnames(mm12_niches))) %>%
+  column_to_rownames("sample")
+meta_spf_niches <- data.frame(sample = colnames(spf_niches),
+                               species = gsub(".*:", "", colnames(spf_niches)),
+                              sample_id = gsub(":.*", "", colnames(spf_niches))) %>%
+  column_to_rownames("sample")
+
+
+# try with umap
+mm12_umap <- as.data.frame(umap::umap(t(mm12_niches))$layout)
+meta_mm12_niches$UMAP1 <- mm12_umap$V1
+meta_mm12_niches$UMAP2 <- mm12_umap$V2
+
+ggplot(meta_mm12_niches, aes(x = UMAP1, y = UMAP2, color = species)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_manual(values = species_colors) +
+  theme(legend.position = "none")
+
+ggsave("export.dir/mm12_umap_niches.pdf", height = 2.5, width = 2.5)
+
+# what are the import mets that distinguish akkermansia
+akk_imports <- mm12_imports[mm12_imports$source_organism == "Akkermansia_muciniphila_YL44",] %>%
+  group_by(base_metabolite) %>%
+  reframe(organism_flux = sum(organism_flux), metabolite = base_metabolite) %>%
+  distinct()
+  
+akk_imports <- akk_imports[order(akk_imports$organism_flux, decreasing = FALSE),]
+
+# Colour buy some key ones
+meta_mm12_niches$glu_L <- unlist(mm12_niches["glu_L",])
+meta_mm12_niches$man <- log10(10^unlist(mm12_niches["man",]))
+meta_mm12_niches$asp_L <- log10(10^unlist(mm12_niches["asp_L",]))
+meta_mm12_niches$mqn7 <- log10(10^unlist(mm12_niches["mqn7",]))
+meta_mm12_niches$alaglu <- log10(10^unlist(mm12_niches["alaglu",]))
+
+mois_import <- c("man", "asp_L", "mqn7", "alaglu")
+
+man <- ggplot(meta_mm12_niches, aes(x = UMAP1, y = UMAP2, color = man)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none")
+
+ggsave("export.dir/mm12_man_import.pdf", height = 2.5, width = 2.5)
+
+alaglu <- ggplot(meta_mm12_niches, aes(x = UMAP1, y = UMAP2, color = alaglu)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none")
+
+ggsave("export.dir/mm12_alaglu_import.pdf", height = 2.5, width = 2.5)
+
+mqn7 <- ggplot(meta_mm12_niches, aes(x = UMAP1, y = UMAP2, color = mqn7)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none")
+
+ggsave("export.dir/mm12_mqn7_import.pdf", height = 2.5, width = 2.5)
+
+asp_l <- ggplot(meta_mm12_niches, aes(x = UMAP1, y = UMAP2, color = asp_L)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none")
+
+ggsave("export.dir/mm12_asp_L_import.pdf", height = 2.5, width = 2.5)
+
+gridExtra::grid.arrange(man, alaglu, mqn7, asp_l, nrow = 2)
+
+    
+spf_umap <- as.data.frame(umap::umap(t(spf_niches))$layout)
+meta_spf_niches$UMAP1 <- spf_umap$V1
+meta_spf_niches$UMAP2 <- spf_umap$V2
+
+# add annotations for mm12 species
+mm12_annotations <- unlist(strain_mapping, use.names = FALSE)
+
+meta_spf_niches$relab <- spf_abundances[meta_spf_niches$species,]$abundance
+meta_spf_niches$size <- ifelse(meta_spf_niches$species %in% mm12_annotations, "Yes", "No")
+
+
+ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2,
+                            color = species,
+                            size = size,
+                            group = sample_id)) +
+  geom_point() +
+  theme_classic() +
+  scale_size_manual(values = c(0.5, 2)) +
+  scale_color_manual(values = species_colors) +
+  theme(legend.position = "none")
+
+ggsave("export.dir/spf_umap_niches.pdf", height = 2.5, width = 2.5)
+
+# candidates of interest
+meta_spf_niches$man <- log10(10^unlist(spf_niches["man",]))
+meta_spf_niches$asp_L <- log10(10^unlist(spf_niches["asp_L",]))
+meta_spf_niches$mqn7 <- log10(10^unlist(spf_niches["mqn7",]))
+meta_spf_niches$alaglu <- log10(10^unlist(spf_niches["alaglu",]))
+meta_spf_niches$tchola <- log10(10^unlist(spf_niches["tchola",]))
+
+man_s <- ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2, size = size, color = man)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none") +
+  scale_size_manual(values = c(0.5, 2))
+
+ggsave("export.dir/spf_man_import.pdf", height = 2.5, width = 2.5)
+
+alaglu_s <- ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2, size = size, color = alaglu)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none") +
+  scale_size_manual(values = c(0.5, 2))
+
+ggsave("export.dir/spf_alaglu_import.pdf", height = 2.5, width = 2.5)
+
+mqn7_s <- ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2, size = size, color = mqn7)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none") +
+  scale_size_manual(values = c(0.5, 2))
+
+ggsave("export.dir/spf_mqn7_import.pdf", height = 2.5, width = 2.5)
+
+asp_l_s <- ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2, size = size, color = asp_L)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none") +
+  scale_size_manual(values = c(0.5, 2))
+
+ggsave("export.dir/spf_asp_L_import.pdf", height = 2.5, width = 2.5)
+
+gridExtra::grid.arrange(man_s, alaglu_s, mqn7_s, asp_l_s, nrow = 2)
+
+
+```
+
+## Look at Faecalibacterium duncaniae niche
+
+```{r fdunc niche occupancy, echo = FALSE, message = FALSE}
+
+# is there something that defines that little niche that the 
+# MM12 don't occupy?
+
+library(Seurat)
+spf_niches_sobj <- Seurat::CreateSeuratObject(spf_niches)
+spf_niches_sobj <- NormalizeData(spf_niches_sobj)
+spf_niches_sobj <- ScaleData(spf_niches_sobj)
+spf_niches_sobj <- RunPCA(spf_niches_sobj, features = rownames(spf_niches))
+spf_niches_sobj <- RunUMAP(spf_niches_sobj, dims = 1:30)
+
+# add some annotation
+spf_niches_sobj@meta.data$species <- meta_spf_niches$species
+Idents(spf_niches_sobj) <- meta_spf_niches$species
+
+spf_niches_sobj <- FindNeighbors(spf_niches_sobj, dims = 1:30)
+spf_niches_sobj <- FindClusters(spf_niches_sobj, resolution = 0.5, algorithm = 4)
+DimPlot(spf_niches_sobj)
+
+markers <- FindAllMarkers(spf_niches_sobj, only.pos = FALSE)
+markers <- markers[order(markers$avg_log2FC, decreasing = TRUE),]
+FeaturePlot(spf_niches_sobj, features = "spmd")
+
+meta_spf_niches$fdunc_size <- ifelse(meta_spf_niches$species == "Faecalibacterium_duncaniae",
+                                     "Fduncaniae",
+                                     "Ather")
+ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2,
+                            color = species,
+                            size = fdunc_size,
+                            shape = fdunc_size,
+                            group = sample_id)) +
+  geom_point() +
+  theme_classic() +
+  scale_size_manual(values = c(0.5, 2)) +
+  scale_color_manual(values = species_colors) +
+  theme(legend.position = "none")
+
+meta_spf_niches$gchola <- unlist(spf_niches["gchola",])
+meta_spf_niches$spmd <- unlist(spf_niches["spmd",])
+ggplot(meta_spf_niches, aes(x = UMAP1, y = UMAP2, size = fdunc_size, color = spmd)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_gradient2(low = "snow2",
+                        mid = blues9[7],
+                        high = blues9[9],
+                        breaks = c(-10, -5, -1)) +
+    theme(legend.position = "none") +
+  scale_size_manual(values = c(0.5, 2))
+
+
+```
+
+It is very difficult to say anytning specific about F. duncaniae from this type of analysis unfortunately.
+
+
+## Substrate redundancy
+
+Here we look at which MM12 substrates i.e. imported metabolites are shared between bacteria in the system. At least for mannose, it looks quite interesting because it is only imported by akkermansia rather than other bacteria whereas in SPF it is imported by multiple non-MM12 members as well. 
+
+```{r substrate spread, echo = FALSE, message = FALSE}
+
+sample_names <- unique(mm12_imports$sample_id)
+species_names <- unique(mm12_imports$source_organism)
+metabolites <- unique(mm12_imports$base_metabolite)
+
+mm12_spread <- list()
+for (i in species_names){
+  for (j in metabolites){
+    subbed <- mm12_imports[mm12_imports$source_organism == i &
+                             mm12_imports$base_metabolite == j,]
+    if (sum(subbed$organism_flux < -0.000001) >=3){
+      mm12_spread[[j]] <- append(mm12_spread[[j]], i)
+    }
+  }
+}
+
+sample_names <- unique(spf_imports$sample_id)
+species_names <- unique(spf_imports$source_organism)
+metabolites <- unique(spf_imports$base_metabolite)
+spf_spread <- list()
+for (i in species_names){
+  for (j in metabolites){
+    subbed <- spf_imports[spf_imports$source_organism == i &
+                             spf_imports$base_metabolite == j,]
+    if (sum(subbed$organism_flux < -0.00001) >=3){
+      spf_spread[[j]] <- append(spf_spread[[j]], i)
+    }
+  }
+}
+
+mets_common <- intersect(names(mm12_spread), names(spf_spread))
+
+to_plot_spread <- data.frame(metabolite = mets_common,
+                             SPF = NA,
+                             MM12 = NA) %>%
+  column_to_rownames("metabolite")
+
+for (i in mets_common){
+  to_plot_spread[i,]$SPF <- length(unlist(spf_spread[i]))
+  to_plot_spread[i,]$MM12 <- length(unlist(mm12_spread[i]))
+}
+
+to_plot_spread$metabolite <- rownames(to_plot_spread)
+to_plot_spread$diff <- to_plot_spread$SPF - to_plot_spread$MM12
+
+to_plot_spread <- to_plot_spread %>%
+  pivot_longer(cols = !metabolite, values_to = "count", names_to = "status")
+
+to_plot_overall <- to_plot_spread[to_plot_spread$metabolite %in% rownames(mm12_niches),]
+to_plot_overall <- subset(to_plot_overall, subset = status != "diff")
+to_plot_diff <- subset(to_plot_spread, subset = status == "diff") %>%
+  subset(subset = metabolite %in% rownames(mm12_niches))
+
+
+ggplot(to_plot_overall, aes(x = metabolite, y = count, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_classic() +
+  scale_fill_manual(values = group_colours) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# diff plot
+to_plot_diff <- to_plot_diff[order(to_plot_diff$count, decreasing = TRUE),]
+to_plot_diff$metabolite <- factor(to_plot_diff$metabolite, levels = to_plot_diff$metabolite)
+to_plot_diff$color <- ifelse(to_plot_diff$count > 0, "SPF", "MM12")
+
+ggplot(to_plot_diff, aes(x = metabolite, y = count, fill = color)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = group_colours)
+
+ggsave("export.dir/metabolite_spread.pdf", height = 2.5, width = 10)
+```
+
+
+```{r write out tables, echo = FALSE, message = FALSE}
+
+# spf tables
+write.table(data.frame(metabolite = rownames(spf_wide), spf_wide),
+            file = "export.dir/spf_metabolites_matrix.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+# mm12 tables
+write.table(data.frame(metabolite = rownames(mm12_wide), mm12_wide),
+            file = "export.dir/mm12_metabolites_matrix.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+
+
+
+# Is there a nice way to draw import and export fluxes per bacterium
+
+
+```{r graphs, echo = FALSE, message = FALSE}
+
+
+# e.g Lactobacillus
+
+# how reproducible are the fluxes
+akkermansia <- subset(expanded, subset = source_organism == "Akkermansia_muciniphila_YL44")
+akkermansia$label <- ifelse(akkermansia$name == "Acetate", "Acetate", NA)
+ggplot(akkermansia, aes(x = sample_id, y = organism_flux, color = name)) +
+  geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  facet_wrap(~flux_type, scales = "free") +
+  ggrepel::geom_text_repel(label = akkermansia$label)
+
+
+
+
+
+
+
+```
+
+
+
+
+

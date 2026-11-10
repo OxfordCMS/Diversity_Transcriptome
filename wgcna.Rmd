@@ -1,0 +1,3404 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load libraries, echo = FALSE, message = FALSE}
+
+source("~/devel/Diversity_Transcriptome/R/utils.R")
+
+library(WGCNA)
+library(tidyverse)
+library(OCMSutility)
+library(ggplot2)
+library(dplyr)
+library(clusterProfiler)
+library(org.Mm.eg.db)  
+library(pheatmap)
+library(circlize)
+library(corrr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(ggrepel)
+library(ComplexHeatmap)
+library(viridis)
+library(stringr)
+
+
+```
+
+```{r colours, echo = FALSE, message = FALSE}
+
+spectral <- brewer.pal(11, 'Spectral')
+group_colours <- c('liver_GF' = spectral[3],
+                   'liver_SPF' = spectral[1],
+                   'liver_MM12' = spectral[2],
+                   'ileum_GF' = spectral[9],
+                   'ileum_SPF' = spectral[11],
+                   'ileum_MM12' = spectral[10],
+                   'Liver_GF' = spectral[3],
+                   'Liver_SPF' = spectral[1],
+                   'Liver_MM12' = spectral[2],
+                   'Ileum_GF' = spectral[9],
+                   'Ileum_SPF' = spectral[11],
+                   'Ileum_MM12' = spectral[10],
+                   'liver_gf' = spectral[3],
+                   'liver_spf' = spectral[1],
+                   'liver_mm12' = spectral[2],
+                   'ileum_gf' = spectral[9],
+                   'ileum_spf' = spectral[11],
+                   'ileum_mm12' = spectral[10],
+                   'GF' = spectral[9],
+                   'MM12' = spectral[10],
+                   'SPF' = spectral[11])
+
+```
+
+
+
+
+
+```{r read data in, echo = FALSE, message = FALSE}
+
+ileum_normed_dat_corrected <- readRDS("export.dir/ileum_normed_corrected.Rds")
+liver_normed_dat <- readRDS("export.dir/liver_normed.Rds")
+results <- readRDS("export.dir/results.Rds")
+
+# metadata
+ileum_metadata <- read.table('/well/powrie/users/cqh100/work/mouse_rna_seq/splicing/ileum_metadata_with_PC_correction.tsv', sep = '\t', header = TRUE)
+
+ileum_metadata <- subset(ileum_metadata, age == 'Young')
+ileum_metadata <- subset(ileum_metadata, group == 'Solo')
+ileum_metadata$status <- as.factor(ileum_metadata$status)
+rownames(ileum_metadata) <- ileum_metadata$sample_id
+colnames(ileum_metadata)[1] <- 'sampleID'
+rownames(ileum_metadata) <- ileum_metadata$sampleID
+
+## Liver
+# metadata
+metadata <- as.data.frame(readxl::read_xlsx(path = '/well/powrie/users/cqh100/work/mouse_rna_seq/metadata_fordeseq.xlsx'))
+
+liver_metadata <- subset(metadata, tissue == 'liver')
+liver_metadata <- subset(liver_metadata, age == 'Young')
+liver_metadata <- subset(liver_metadata, group == 'Solo')
+liver_metadata$status <- as.factor(liver_metadata$status)
+rownames(liver_metadata) <- liver_metadata$sample_id
+colnames(liver_metadata)[1] <- 'sampleID'
+rownames(liver_metadata) <- liver_metadata$sampleID
+
+```
+
+
+# Does microbiome status impact gene co-expression network topology?
+
+This analysis is focussed on asking whether microbes couple and uncouple biological processes (i.e. co-expression networks). The thinking behind this is that if a certain microbe or metabolite in SPF is responsible for directing certain gene expression profiles in a certain direction then changing the community could in theory uncouple these processes - this would usually be processes that are across different cell types I would have thought but that wouldn't have to be the case.
+
+
+```{r loading data, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# Ileum
+ileum_counts_spf <- as.data.frame(ileum_normed_dat_corrected[, grep("^Ileum(1[0-5]|[1-9])$", colnames(ileum_normed_dat_corrected))])
+
+## need to change the rownames to gene symbols 
+
+ileum_counts_spf <- process_deseq_results(ileum_counts_spf, offline = TRUE)
+ileum_counts_spf <- ileum_counts_spf$res[1:(length(ileum_counts_spf$res)-1)]
+ileum_counts_spf_subset <- ileum_counts_spf[rownames(ileum_counts_spf) %in% rownames(results$Ileum_SPF_vs_GF$deseq), ]
+ileum_counts_spf_subset <- ileum_counts_spf_subset[1:(length(ileum_counts_spf_subset)-1)]
+ileum_counts_t_spf <- t(ileum_counts_spf_subset)
+
+
+# Liver
+liver_counts_spf <- as.data.frame(liver_normed_dat[, grep("^Liver(1[0-5]|[1-9])$", colnames(liver_normed_dat))])
+
+## need to change the rownames to gene symbols 
+liver_counts_spf <- process_deseq_results(liver_counts_spf, offline = TRUE)
+liver_counts_spf <- liver_counts_spf$res[1:(length(liver_counts_spf$res)-1)]
+liver_counts_spf_subset <- liver_counts_spf[rownames(liver_counts_spf) %in% rownames(results$Liver_SPF_vs_GF$deseq), ]
+liver_counts_spf_subset <- liver_counts_spf_subset[1:(length(liver_counts_spf_subset)-1)]
+liver_counts_t_spf <- t(liver_counts_spf_subset)
+
+
+```
+
+Using a soft power threshhold of 7 and 5 in the ileum and liver respectively (Fig X, A), we were able to calculate initial module eigengenes and modules which were over 80% similar were merged to reduce the number of redundant modules (Fig X, B) in the SPF mice alone.
+
+```{r wgcna ileum, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+gsg_spf <- goodSamplesGenes(ileum_counts_t_spf)
+
+if (!gsg_spf$allOK) {
+  if (sum(!gsg_spf$goodGenes) > 0) 
+    printFlush(paste("Removing genes:", paste(names(ileum_counts_t_spf)[!gsg_spf$goodGenes], collapse = ", ")))
+  if (sum(!gsg_spf$goodSamples) > 0)
+    printFlush(paste("Removing samples:", paste(rownames(ileum_counts_t_spf)[!gsg_spf$goodSamples], collapse = ", ")))
+  
+  ileum_counts_t_spf <- ileum_counts_t_spf[gsg_spf$goodSamples, gsg_spf$goodGenes]
+}
+
+spt_spf <- pickSoftThreshold(ileum_counts_t_spf)
+softPower_spf <- 7
+adjacency_spf <- adjacency(ileum_counts_t_spf, power = softPower_spf, type = 'signed')
+
+TOM_spf <- TOMsimilarity(adjacency_spf)
+TOM_spf.dissimilarity <- 1 - TOM_spf
+
+geneTree_spf <- hclust(as.dist(TOM_spf.dissimilarity), method = "average")
+Modules_spf <- cutreeDynamic(dendro = geneTree_spf, distM = TOM_spf.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 100)
+ModuleColors_spf <- labels2colors(Modules_spf)
+
+MElist_spf <- moduleEigengenes(ileum_counts_t_spf, colors = ModuleColors_spf)
+MEs_spf <- MElist_spf$eigengenes
+
+ME_spf.dissimilarity <- 1 - cor(MEs_spf, use = "complete")
+METree_spf <- hclust(as.dist(ME_spf.dissimilarity), method = "average")
+
+merge_spf <- mergeCloseModules(ileum_counts_t_spf, ModuleColors_spf, cutHeight = 0.2)
+mergedColors_spf <- merge_spf$colors
+mergedMEs_spf <- merge_spf$newMEs
+
+# create a simple mapping of module and gene
+ileum_modules_df <- data.frame(gene = colnames(ileum_counts_t_spf),
+                         module = mergedColors_spf)
+
+write.table(ileum_modules_df,
+            file = "export.dir/ileum_modules_df.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+# getkMEs for module membership - correlation with MEs
+ileum_kMEs <- as.data.frame(WGCNA::cor(ileum_counts_t_spf, mergedMEs_spf, use = "p"))
+
+# write out the module eigengenes
+write.table(data.frame(sample = rownames(mergedMEs_spf), mergedMEs_spf),
+            file = "export.dir/ileum_mes.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+```{r wgcna liver, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+gsg_spf <- goodSamplesGenes(liver_counts_t_spf)
+
+if (!gsg_spf$allOK) {
+  if (sum(!gsg_spf$goodGenes) > 0) 
+    printFlush(paste("Removing genes:", paste(names(liver_counts_t_spf)[!gsg_spf$goodGenes], collapse = ", ")))
+  if (sum(!gsg_spf$goodSamples) > 0)
+    printFlush(paste("Removing samples:", paste(rownames(liver_counts_t_spf)[!gsg_spf$goodSamples], collapse = ", ")))
+  
+  liver_counts_t_spf <- liver_counts_t_spf[gsg_spf$goodSamples, gsg_spf$goodGenes]
+}
+
+spt_spf_liver <- pickSoftThreshold(liver_counts_t_spf)
+softPower_spf_liver <- 5
+adjacency_spf_liver <- adjacency(liver_counts_t_spf, power = softPower_spf_liver, type = 'signed')
+
+TOM_spf_liver <- TOMsimilarity(adjacency_spf_liver)
+TOM_spf_liver.dissimilarity <- 1 - TOM_spf_liver
+
+geneTree_spf_liver <- hclust(as.dist(TOM_spf_liver.dissimilarity), method = "average")
+Modules_spf_liver <- cutreeDynamic(dendro = geneTree_spf_liver, distM = TOM_spf_liver.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 200)
+ModuleColors_spf_liver <- labels2colors(Modules_spf_liver)
+
+MElist_spf_liver <- moduleEigengenes(liver_counts_t_spf, colors = ModuleColors_spf_liver)
+MEs_spf_liver <- MElist_spf_liver$eigengenes
+
+ME_spf_liver.dissimilarity <- 1 - cor(MEs_spf_liver, use = "complete")
+METree_spf_liver <- hclust(as.dist(ME_spf_liver.dissimilarity), method = "average")
+
+merge_spf_liver <- mergeCloseModules(liver_counts_t_spf, ModuleColors_spf_liver, cutHeight = 0.2)
+mergedColors_spf_liver <- merge_spf_liver$colors
+mergedMEs_spf_liver <- merge_spf_liver$newMEs
+
+liver_modules_df <- data.frame(gene = colnames(liver_counts_t_spf),
+                            module = mergedColors_spf_liver)
+
+write.table(data.frame(sample = rownames(mergedMEs_spf_liver), mergedMEs_spf_liver),
+            file = "export.dir/liver_mes.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+```{r wgcna plotting, echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.height= 10, fig.width= 10}
+#dev.off()  
+
+layout(matrix(1:6, nrow = 3, byrow = TRUE))
+par(mar = c(5, 4, 4, 2))
+
+# A
+plot(spt_spf$fitIndices$Power, spt_spf$fitIndices$SFT.R.sq,
+     xlab = "Soft Threshold", ylab = "R²",
+     main = "Ileum: Scale-Free Topology Fit", type = "n",
+     cex.lab = 2, cex.main = 2, cex.axis = 2)
+text(spt_spf$fitIndices$Power, spt_spf$fitIndices$SFT.R.sq, labels = spt_spf$fitIndices$Power, col = "red", cex = 2)
+abline(h = 0.70, col = "red")
+#mtext("A", side = 3, adj = 0, line = 1.5, cex = 2.5, font = 2)
+
+# B
+plot(spt_spf_liver$fitIndices$Power, spt_spf_liver$fitIndices$SFT.R.sq,
+     xlab = "Soft Threshold", ylab = "R²",
+     main = "Liver: Scale-Free Topology Fit", type = "n",
+     cex.lab = 2, cex.main = 2, cex.axis = 2)
+text(spt_spf_liver$fitIndices$Power, spt_spf_liver$fitIndices$SFT.R.sq, labels = spt_spf_liver$fitIndices$Power, col = "red", cex = 2)
+abline(h = 0.80, col = "red")
+#mtext("B", side = 3, adj = 0, line = 1.5, cex = 2.5, font = 2)
+
+# C
+plot(spt_spf$fitIndices$Power, spt_spf$fitIndices$mean.k.,
+     xlab = "Soft Threshold", ylab = "Connectivity",
+     main = "Ileum: Mean Connectivity", type = "n",
+     cex.lab = 2, cex.main = 2, cex.axis = 2)
+text(spt_spf$fitIndices$Power, spt_spf$fitIndices$mean.k., labels = spt_spf$fitIndices$Power, col = "red", cex = 2)
+#mtext("C", side = 3, adj = 0, line = 1.5, cex = 2.5, font = 2)
+
+# D
+plot(spt_spf_liver$fitIndices$Power, spt_spf_liver$fitIndices$mean.k.,
+     xlab = "Soft Threshold", ylab = "Connectivity",
+     main = "Liver: Mean Connectivity", type = "n",
+     cex.lab = 2, cex.main = 2, cex.axis = 2)
+text(spt_spf_liver$fitIndices$Power, spt_spf_liver$fitIndices$mean.k., labels = spt_spf_liver$fitIndices$Power, col = "red", cex = 2)
+#mtext("D", side = 3, adj = 0, line = 1.5, cex = 2.5, font = 2)
+
+
+### faceted version
+combined_data <- bind_rows(
+  spt_spf$fitIndices %>% mutate(tissue = "Ileum"),
+  spt_spf_liver$fitIndices %>% mutate(tissue = "Liver")
+) %>%
+  select(Power, SFT.R.sq, mean.k., tissue) %>%
+  pivot_longer(cols = c(SFT.R.sq, mean.k.), 
+               names_to = "metric", 
+               values_to = "value") %>%
+  mutate(
+    metric_label = case_when(
+      metric == "SFT.R.sq" ~ "Scale-Free Topology Fit",
+      metric == "mean.k." ~ "Mean Connectivity"
+    ),
+    y_label = case_when(
+      metric == "SFT.R.sq" ~ "R²",
+      metric == "mean.k." ~ "Connectivity"
+    )
+  )
+
+ggplot(combined_data, aes(x = Power, y = value)) +
+  geom_text(aes(label = Power), color = "red", size = 6) +
+  geom_hline(data = filter(combined_data, metric == "SFT.R.sq", tissue == "Ileum"), 
+             aes(yintercept = 0.70), color = "red") +
+  geom_hline(data = filter(combined_data, metric == "SFT.R.sq", tissue == "Liver"), 
+             aes(yintercept = 0.80), color = "red") +
+  facet_grid(metric_label ~ tissue, scales = "free_y", 
+             labeller = labeller(metric_label = label_value, tissue = label_value)) +
+  labs(x = "Soft Threshold", y = "") +
+  base_theme +
+  theme(
+    strip.text = element_text(size = 20, face = "bold")
+  )
+
+```
+
+```{r wgcna stats}
+
+ileum_stats <- extract_wgcna_stats(ileum_counts_t_spf, mergedColors_spf, "ILE")
+liver_stats <- extract_wgcna_stats(liver_counts_t_spf, mergedColors_spf_liver, "LIV")
+knitr::kable(ileum_stats)
+knitr::kable(liver_stats)
+
+```
+
+
+## Functional enrichment
+
+Here we look at performing functional enrichments on each module. This gives us a general picture of the co-expressed modules.
+
+
+```{r enrichments in SPF, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# For ileum data
+ileum_results <- analyzeModuleData(mergedColors_spf, ileum_counts_t_spf, "Ileum")
+
+# For liver data
+liver_results <- analyzeModuleData(mergedColors_spf_liver, liver_counts_t_spf, "Liver")
+```
+
+### General module overview - number of genes
+
+```{r ngenes modules, echo = FALSE, message = FALSE}
+
+ileum_stats$Module <- factor(ileum_stats$Module, levels = ileum_stats$Module)
+ggplot(ileum_stats, aes(x = Module, y = Number_of_Genes)) +
+  geom_bar(stat="identity", fill = "#5E4FA2", color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("export.dir/ileum_ngenes_modules.pdf", height = 2.5, width = 5)
+
+liver_stats$Module <- factor(liver_stats$Module, levels = liver_stats$Module)
+ggplot(liver_stats, aes(x = Module, y = Number_of_Genes)) +
+  geom_bar(stat="identity", fill = "#9E0142", color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("export.dir/liver_ngenes_modules.pdf", height = 2.5, width = 5)
+
+```
+
+
+### Plotting associated pathways
+
+```{r module pathways, echo = FALSE, message = FALSE}
+
+ileum_go <- ileum_results$go_terms
+ileum_go <- ileum_go[order(ileum_go$Module),]
+ileum_go$GOterm <- factor(ileum_go$GOterm,
+                          levels = unique(ileum_go$GOterm))
+
+module_colors <- as.character(unique(ileum_go$Module))
+names(module_colors) <- unique(ileum_go$Module)
+
+ggplot(ileum_go, aes(x = GOterm,
+                     y = -log10(Pvalue),
+                     fill = Module)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_classic() +
+  scale_fill_manual(values = module_colors) +
+  coord_flip() +
+  facet_wrap(~Module, scales = "free", ncol = 1) +
+  theme(legend.position = "none")
+
+ggsave("export.dir/ileum_module_pathways.pdf", height = 20, width = 10)
+
+
+# liver
+liver_go <- liver_results$go_terms
+liver_go <- liver_go[order(liver_go$Module),]
+liver_go$GOterm <- factor(liver_go$GOterm,
+                          levels = unique(liver_go$GOterm))
+
+module_colors <- as.character(unique(liver_go$Module))
+names(module_colors) <- unique(liver_go$Module)
+
+ggplot(liver_go, aes(x = GOterm,
+                     y = -log10(Pvalue),
+                     fill = Module)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_classic() +
+  scale_fill_manual(values = module_colors) +
+  coord_flip() +
+  facet_wrap(~Module, scales = "free", ncol = 1) +
+  theme(legend.position = "none")
+
+ggsave("export.dir/liver_module_pathways.pdf", height = 20, width = 10)
+```
+
+
+## Highest correlations in modules
+
+```{r correlations within modules, echo = FALSE, message = FALSE}
+
+ileum_cors <- list()
+modules <- unique(ileum_modules_df$module)
+for (i in 1:length(modules)){
+  genes <- ileum_modules_df$gene[ileum_modules_df$module == modules[i]]
+  all_cors <- cor(ileum_counts_t_spf[,genes])
+  all_cors <- OCMSutility::sym_mat2df(all_cors)
+  all_cors$module <- modules[i]
+  all_cors <- all_cors[order(all_cors$value, decreasing = TRUE),]
+  ileum_cors[[i]] <- all_cors
+}
+ileum_cors <- bind_rows(ileum_cors)
+
+# liver
+liver_cors <- list()
+liver_modules <- unique(liver_modules_df$module)
+for (i in 1:length(liver_modules)){
+  genes <- liver_modules_df$gene[liver_modules_df$module == liver_modules[i]]
+  all_cors <- cor(liver_counts_t_spf[,genes])
+  all_cors <- OCMSutility::sym_mat2df(all_cors)
+  all_cors$module <- liver_modules[i]
+  all_cors <- all_cors[order(all_cors$value, decreasing = TRUE),]
+  liver_cors[[i]] <- all_cors
+}
+liver_cors <- bind_rows(liver_cors)
+```
+
+### Average correlations (median connectivity) and variance explained along PC1
+
+```{r median connectivity, echo = FALSE, message = FALSE}
+
+# ileum
+ileum_median_cors <- list()
+for (i in modules){
+  median_cor <- median(ileum_cors$value[ileum_cors$X1 != ileum_cors$X2 & ileum_cors$module == i])
+  ileum_median_cors[[i]] <- median_cor
+}
+
+liver_median_cors <- list()
+for (i in liver_modules){
+  median_cor <- median(liver_cors$value[liver_cors$X1 != liver_cors$X2 & liver_cors$module == i])
+  liver_median_cors[[i]] <- median_cor
+}
+
+## PC1 instead ie. variance explained for each module
+
+# Ileum
+ileum_pc1 <- list()
+for (i in modules){
+  genes <- ileum_modules_df$gene[ileum_modules_df$module == i]
+  pc <- prcomp(ileum_counts_t_spf[,genes])
+  var_explained <- pc$sdev^2
+  pve_pc1 <- var_explained[1] / sum(var_explained)
+  ileum_pc1[[i]] <- pve_pc1
+}
+
+# Liver
+liver_pc1 <- list()
+for (i in liver_modules){
+  genes <- liver_modules_df$gene[liver_modules_df$module == i]
+  pc <- prcomp(liver_counts_t_spf[,genes])
+  var_explained <- pc$sdev^2
+  pve_pc1 <- var_explained[1] / sum(var_explained)
+  liver_pc1[[i]] <- pve_pc1
+}
+
+# add to gene set size
+ileum_stats$Module <- as.character(ileum_stats$Module)
+ileum_stats$module <- gsub(".*- ", "", ileum_stats$Module)
+ileum_stats$PC1_VE <- unlist(ileum_pc1[ileum_stats$module], use.names = FALSE)
+
+liver_stats$module <- gsub(".*- ", "", liver_stats$Module)
+liver_stats$PC1_VE <- unlist(liver_pc1[liver_stats$module], use.names = FALSE)
+
+ileum_module_colors <- unique(ileum_stats$module)
+names(ileum_module_colors) <- unique(ileum_stats$module)
+
+ileum_stats <- ileum_stats[order(ileum_stats$PC1_VE, decreasing = TRUE),]
+ileum_stats$Module <- factor(ileum_stats$Module, levels = ileum_stats$Module)
+ggplot(ileum_stats, aes(x = Module, y = PC1_VE, size = Number_of_Genes, color = module)) +
+  geom_point() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = ileum_module_colors) +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.95, 0.95)) +
+  guides(color = "none")
+ggsave("export.dir/ileum_ngenes_connectivity_modules.pdf", height = 2.5, width = 5)
+
+
+
+liver_stats$Module <- factor(liver_stats$Module, levels = liver_stats$Module)
+ggplot(liver_stats, aes(x = Module, y = Number_of_Genes, size = PC1_VE)) +
+  geom_point(color = "#9E0142") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("export.dir/liver_ngenes_connectivity_modules.pdf", height = 2.5, width = 5)
+
+```
+
+
+## Preservation
+
+Next we look at how well the modules are preserved in GF and MM12 mice - this is using the built-in WGCNA preservation statistics and we are using the overall Z-score as a guide.
+
+```{r module preservation ileum, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+allowWGCNAThreads(nThreads = 14)
+
+if (!file.exists("export.dir/ileum_preservation.Rds")){
+
+# ==============================================================================
+# DATA PREPROCESSING
+# ==============================================================================
+
+ileum_counts_all <- as.data.frame(ileum_normed_dat_corrected)
+ileum_counts_all <- process_deseq_results(ileum_counts_all, offline = TRUE)
+ileum_counts_all <- ileum_counts_all$res[1:(length(ileum_counts_all$res)-1)]
+ileum_counts_all <- ileum_counts_all[1:(length(ileum_counts_all)-1)]
+ileum_counts_all <- ileum_counts_all[rowSums(ileum_counts_all >= 10) >= 15, ]
+
+# ==============================================================================
+# SAMPLE EXTRACTION
+# ==============================================================================
+
+spf_samples_ileum <- ileum_metadata$sampleID[ileum_metadata$age == 'Young' & 
+                                       ileum_metadata$group == 'Solo' &
+                                       ileum_metadata$status == "SPF"]
+
+gf_samples_ileum <- ileum_metadata$sampleID[ileum_metadata$age == 'Young' & 
+                                      ileum_metadata$group == 'Solo' &
+                                      ileum_metadata$status == "GF"]
+
+mm12_samples_ileum <- ileum_metadata$sampleID[ileum_metadata$age == 'Young' & 
+                                        ileum_metadata$group == 'Solo' &
+                                        ileum_metadata$status == "MM12"]
+
+extract_group_data <- function(expr_data, sample_ids) {
+  return(expr_data[, sample_ids])
+}
+
+spf_data_ileum  <- extract_group_data(ileum_counts_all, spf_samples_ileum)
+gf_data_ileum  <- extract_group_data(ileum_counts_all, gf_samples_ileum)
+mm12_data_ileum  <- extract_group_data(ileum_counts_all, mm12_samples_ileum)
+
+
+# ==============================================================================
+# MODULE PRESERVATION ANALYSIS
+# ==============================================================================
+
+# Test preservation in GF
+multiExpr_gf_ileum <- list(
+  SPF = list(data = ileum_counts_t_spf),
+  GF = list(data = t(gf_data_ileum))
+)
+multiColor_spf <- list(SPF = mergedColors_spf)
+
+mp_spf_to_gf_ileum <- modulePreservation(
+  multiExpr_gf_ileum,
+  multiColor_spf,
+  referenceNetworks = 1,
+  networkType = "signed",
+  nPermutations = 500,
+  randomSeed = 1,
+  parallelCalculation = TRUE,
+  verbose = 3
+)
+
+# Test preservation in MM12
+multiExpr_mm12_ileum <- list(
+  SPF = list(data = ileum_counts_t_spf),
+  MM12 = list(data = t(mm12_data_ileum))
+)
+
+mp_spf_to_mm12_ileum <- modulePreservation(
+  multiExpr_mm12_ileum,
+  multiColor_spf,
+  referenceNetworks = 1,
+  networkType = "signed",
+  nPermutations = 500,
+  parallelCalculation = TRUE,
+  randomSeed = 1,
+  verbose = 3
+)
+# ==============================================================================
+# EXTRACT PRESERVATION STATISTICS
+# ==============================================================================
+
+stats_gf_ileum <- mp_spf_to_gf_ileum$preservation$Z$ref.SPF$inColumnsAlsoPresentIn.GF
+stats_mm12_ileum <- mp_spf_to_mm12_ileum$preservation$Z$ref.SPF$inColumnsAlsoPresentIn.MM12
+
+# Create comprehensive preservation comparison dataframe
+preservation_comparison_ileum <- data.frame(
+  Module = rownames(stats_gf_ileum),
+  ModuleSize = stats_gf_ileum[, "moduleSize"],
+  Z_GF = stats_gf_ileum[, "Zsummary.pres"],
+  Z_MM12 = stats_mm12_ileum[, "Zsummary.pres"],
+  GF_Coexpression = stats_gf_ileum[, "Zdensity.pres"],
+  GF_HubStability = stats_gf_ileum[, "Zconnectivity.pres"],
+  MM12_Coexpression = stats_mm12_ileum[, "Zdensity.pres"],
+  MM12_HubStability = stats_mm12_ileum[, "Zconnectivity.pres"]
+)
+
+# Add GO terms
+module_descriptions_ileum <- setNames(ileum_results$module_terms$GOterm, ileum_results$module_terms$Module)
+preservation_comparison_ileum$GOterm <- module_descriptions_ileum[preservation_comparison_ileum$Module]
+
+saveRDS(preservation_comparison_ileum, file = "export.dir/ileum_preservation.Rds")
+
+# ==============================================================================
+# DATA PREPROCESSING
+# ==============================================================================
+
+liver_counts_all <- as.data.frame(liver_normed_dat)
+liver_counts_all <- process_deseq_results(liver_counts_all, offline = TRUE)
+liver_counts_all <- liver_counts_all$res[1:(length(liver_counts_all$res)-1)]
+liver_counts_all <- liver_counts_all[1:(length(liver_counts_all)-1)]
+liver_counts_all <- liver_counts_all[rowSums(liver_counts_all >= 10) >= 15, ]
+
+# ==============================================================================
+# SAMPLE EXTRACTION
+# ==============================================================================
+
+spf_samples_liver <- liver_metadata$sampleID[liver_metadata$age == 'Young' & 
+                                       liver_metadata$group == 'Solo' &
+                                       liver_metadata$status == "SPF"]
+
+gf_samples_liver <- liver_metadata$sampleID[liver_metadata$age == 'Young' & 
+                                      liver_metadata$group == 'Solo' &
+                                      liver_metadata$status == "GF"]
+
+mm12_samples_liver <- liver_metadata$sampleID[liver_metadata$age == 'Young' & 
+                                        liver_metadata$group == 'Solo' &
+                                        liver_metadata$status == "MM12"]
+
+spf_data_liver <- extract_group_data(liver_counts_all, spf_samples_liver)
+gf_data_liver <- extract_group_data(liver_counts_all, gf_samples_liver)
+mm12_data_liver <- extract_group_data(liver_counts_all, mm12_samples_liver)
+
+
+# ==============================================================================
+# MODULE PRESERVATION ANALYSIS
+# ==============================================================================
+
+# Test preservation in GF
+multiExpr_gf_liver <- list(
+  SPF = list(data = liver_counts_t_spf),
+  GF = list(data = t(gf_data_liver))
+)
+multiColor_spf <- list(SPF = mergedColors_spf_liver)
+
+mp_spf_to_gf_liver <- modulePreservation(
+  multiExpr_gf_liver,
+  multiColor_spf,
+  referenceNetworks = 1,
+  networkType = "signed",
+  nPermutations = 500,
+  randomSeed = 1,
+  parallelCalculation = TRUE,
+  verbose = 3
+)
+
+# Test preservation in MM12
+multiExpr_mm12_liver <- list(
+  SPF = list(data = liver_counts_t_spf),
+  MM12 = list(data = t(mm12_data_liver))
+)
+
+mp_spf_to_mm12_liver <- modulePreservation(
+  multiExpr_mm12_liver,
+  multiColor_spf,
+  referenceNetworks = 1,
+  networkType = "signed",
+  nPermutations = 500,
+  randomSeed = 1,
+  parallelCalculation = TRUE,
+  verbose = 3
+)
+
+# ==============================================================================
+# EXTRACT PRESERVATION STATISTICS
+# ==============================================================================
+
+stats_gf_liver <- mp_spf_to_gf_liver$preservation$Z$ref.SPF$inColumnsAlsoPresentIn.GF
+stats_mm12_liver <- mp_spf_to_mm12_liver$preservation$Z$ref.SPF$inColumnsAlsoPresentIn.MM12
+
+# Create comprehensive preservation comparison dataframe
+preservation_comparison_liver <- data.frame(
+  Module = rownames(stats_gf_liver),
+  ModuleSize = stats_gf_liver[, "moduleSize"],
+  Z_GF = stats_gf_liver[, "Zsummary.pres"],
+  Z_MM12 = stats_mm12_liver[, "Zsummary.pres"],
+  GF_Coexpression = stats_gf_liver[, "Zdensity.pres"],
+  GF_HubStability = stats_gf_liver[, "Zconnectivity.pres"],
+  MM12_Coexpression = stats_mm12_liver[, "Zdensity.pres"],
+  MM12_HubStability = stats_mm12_liver[, "Zconnectivity.pres"]
+)
+
+# Add GO terms
+module_descriptions_liver <- setNames(liver_results$module_terms$GOterm, liver_results$module_terms$Module)
+preservation_comparison_liver$GOterm <- module_descriptions_liver[preservation_comparison_liver$Module]
+saveRDS(preservation_comparison_liver, file = "export.dir/liver_preservation.Rds")
+
+}else{
+  preservation_comparison_ileum <- readRDS("export.dir/ileum_preservation.Rds")
+  preservation_comparison_liver <- readRDS("export.dir/liver_preservation.Rds")}
+
+
+```
+
+```{r module preservation visualisation ileum, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# Add the PC1_VE bits to this
+
+# ileum
+preservation_comparison_ileum <- preservation_comparison_ileum[order(preservation_comparison_ileum$Module),] 
+preservation_comparison_ileum <- subset(preservation_comparison_ileum, subset = Module != "gold")
+ileum_stats <- ileum_stats[order(ileum_stats$module),]
+preservation_comparison_ileum$PC1_VE <- ileum_stats$PC1_VE
+
+# liver
+preservation_comparison_liver <- preservation_comparison_liver[order(preservation_comparison_liver$Module),] 
+liver_stats <- liver_stats[order(liver_stats$module),]
+preservation_comparison_liver$PC1_VE <- liver_stats$PC1_VE
+
+ileum_module_colors <- unique(preservation_comparison_ileum$Module)
+names(ileum_module_colors) <- unique(preservation_comparison_ileum$Module)
+
+ggplot(preservation_comparison_ileum, aes(x = Z_GF,
+                                          y = Z_MM12,
+                                          color = Module,
+                                          size = PC1_VE)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_manual(values = ileum_module_colors) +
+  geom_hline(yintercept = c(2,10), linetype = "dashed") +
+  geom_vline(xintercept = c(2, 10), linetype = "dashed") +
+  theme(legend.position = "none") +
+  xlim(c(0,40)) +
+  ylim(0,40) +
+  geom_abline(slope = 1, linetype = "dashed")
+ggsave("export.dir/presservation_ileum.pdf", height = 2.5, width = 2.5)
+
+liver_module_colors <- unique(preservation_comparison_liver$Module)
+names(liver_module_colors) <- unique(preservation_comparison_liver$Module)
+ggplot(preservation_comparison_liver, aes(x = Z_GF,
+                                          y = Z_MM12,
+                                          color = Module,
+                                          size = PC1_VE)) +
+  geom_point() +
+  theme_classic() +
+  scale_color_manual(values = liver_module_colors) +
+  geom_hline(yintercept = c(2,10), linetype = "dashed") +
+  geom_vline(xintercept = c(2, 10), linetype = "dashed") +
+  theme(legend.position = "none") +
+  xlim(c(0,45)) +
+  ylim(0,45) +
+  geom_abline(slope = 1, linetype = "dashed")
+ggsave("export.dir/preservation_liver.pdf", height = 2.5, width = 2.5)
+
+```
+
+## Interesting module associations
+
+The scatterplot looks super interesting in that the green module is preserved in the MM12 but not in germ-free, whereas darkgreen is not preserved in either. We have observed some interesting associations with F. duncaniae later on in the analysis and so do want to understand these modules a bit better - should we be looking at all of the genes or subsets that have functional associations. This has not been completely clear so far as different sub modules of genes will show different patterns.
+
+Here we will look at how the different module graphs look for modules of interest across microbiome states.
+
+### Ileum
+
+#### Green module
+
+Green module looks very interesting as it is more preserved in teh MM12 than in the GF. 
+
+
+```{r green module, echo = FALSE, message = FALSE}
+
+aggy <- geneid2genename[rownames(ileum_normed_dat_corrected),]$gene_name
+ileum_exprs_all <- aggregate(ileum_normed_dat_corrected,
+                             by = list(aggy),
+                             FUN = "mean") %>%
+  column_to_rownames(var = "Group.1")
+
+# GO: fatty acid metabolic process
+green_gois <- unlist(strsplit(ileum_results$go_results$green[2,]$geneID, "/"))
+
+spf_samples <- rownames(ileum_metadata[ileum_metadata$status == "SPF" & ileum_metadata$age == "Young",])
+mm12_samples <- rownames(ileum_metadata[ileum_metadata$status == "MM12" & ileum_metadata$age == "Young",])
+gf_samples <- rownames(ileum_metadata[ileum_metadata$status == "GF" & ileum_metadata$age == "Young",])
+
+# green gois
+green_spf_exprs <- na.omit(ileum_exprs_all[green_gois, spf_samples])
+green_mm12_exprs <- na.omit(ileum_exprs_all[green_gois, mm12_samples])
+green_gf_exprs <- na.omit(ileum_exprs_all[green_gois, gf_samples])
+
+spf_cors <- correlate(t(green_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(green_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(green_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+ # filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+green_spf_graph <- ggraph(spf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+green_mm12_graph <- ggraph(mm12_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+green_gf_graph <- ggraph(gf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(green_spf_graph, green_mm12_graph, green_gf_graph, nrow = 1)
+
+ggsave(green_spf_graph, file = "export.dir/green_module_spf.pdf", height = 2.5, width = 3)
+ggsave(green_mm12_graph, file = "export.dir/green_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(green_gf_graph, file = "export.dir/green_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+#### Darkgreen module
+
+
+```{r darkgreen module, echo = FALSE, message = FALSE}
+
+# positive regulation of leukocyte activation
+darkgreen_gois <- unlist(strsplit(ileum_results$go_results$darkgreen[8,]$geneID, "/"))
+
+darkgreen_spf_exprs <- na.omit(ileum_exprs_all[darkgreen_gois, spf_samples])
+darkgreen_mm12_exprs <- na.omit(ileum_exprs_all[darkgreen_gois, mm12_samples])
+darkgreen_gf_exprs <- na.omit(ileum_exprs_all[darkgreen_gois, gf_samples])
+
+spf_cors <- correlate(t(darkgreen_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(darkgreen_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(darkgreen_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+ # filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+darkgreen_spf_graph <- ggraph(spf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  geom_node_text(label = V(spf_graph)$name) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+darkgreen_mm12_graph <- ggraph(mm12_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  geom_node_text(label = V(mm12_graph)$name) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+darkgreen_gf_graph <- ggraph(gf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  geom_node_text(label = V(gf_graph)$name) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(darkgreen_spf_graph, darkgreen_mm12_graph, darkgreen_gf_graph, nrow = 1)
+
+ggsave(green_spf_graph, file = "export.dir/darkgreen_module_spf.pdf", height = 2.5, width = 3)
+ggsave(green_mm12_graph, file = "export.dir/darkgreen_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(green_gf_graph, file = "export.dir/darkgreen_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+#### Purple module
+
+Trying to get a feel for how the different modules change across microbiome states. Purple is an interesting module as is associated with F. duncaniae and is annotated as being associated with mRNA splicing and chromatin things.
+
+```{r purple module, echo = FALSE, message = FALSE}
+
+# GO: RNA splicing
+purple_gois <- unlist(strsplit(ileum_results$go_results$purple[2,]$geneID, "/"))
+
+purple_spf_exprs <- na.omit(ileum_exprs_all[purple_gois, spf_samples])
+purple_mm12_exprs <- na.omit(ileum_exprs_all[purple_gois, mm12_samples])
+purple_gf_exprs <- na.omit(ileum_exprs_all[purple_gois, gf_samples])
+
+spf_cors <- correlate(t(purple_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(purple_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(purple_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+ # filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+purple_spf_graph <- ggraph(spf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+purple_mm12_graph <- ggraph(mm12_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+purple_gf_graph <- ggraph(gf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(purple_spf_graph, purple_mm12_graph, purple_gf_graph, nrow = 1)
+
+ggsave(purple_spf_graph, file = "export.dir/purple_module_spf.pdf", height = 2.5, width = 3)
+ggsave(purple_mm12_graph, file = "export.dir/purple_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(purple_gf_graph, file = "export.dir/purple_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+#### Black module
+
+Black module is interesting as it is also associated with F. duncaniae but is well preserved across the microbiome states.
+
+```{r black module, echo = FALSE, message = FALSE}
+
+# Purple module genes associated with mRNA processing
+black_gois <- unlist(strsplit(ileum_results$go_results$black[2,]$geneID, "/"))
+
+black_spf_exprs <- na.omit(ileum_exprs_all[black_gois, spf_samples])
+black_mm12_exprs <- na.omit(ileum_exprs_all[black_gois, mm12_samples])
+black_gf_exprs <- na.omit(ileum_exprs_all[black_gois, gf_samples])
+
+spf_cors <- correlate(t(black_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(black_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(black_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+ # filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_spf_graph <- ggraph(spf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_mm12_graph <- ggraph(mm12_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_gf_graph <- ggraph(gf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(black_spf_graph, black_mm12_graph, black_gf_graph, nrow = 1)
+
+ggsave(black_spf_graph, file = "export.dir/black_module_spf.pdf", height = 2.5, width = 3)
+ggsave(black_mm12_graph, file = "export.dir/black_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(black_gf_graph, file = "export.dir/black_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+#### Tan module
+
+
+```{r tan module, echo = FALSE, message = FALSE}
+
+# tan module genes - GO muscle cell differentiation. Fibroblasts or endothelium
+tan_gois <- unlist(strsplit(ileum_results$go_results$tan[5,]$geneID, "/"))
+
+tan_spf_exprs <- na.omit(ileum_exprs_all[tan_gois, spf_samples])
+tan_mm12_exprs <- na.omit(ileum_exprs_all[tan_gois, mm12_samples])
+tan_gf_exprs <- na.omit(ileum_exprs_all[tan_gois, gf_samples])
+
+spf_cors <- correlate(t(tan_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(tan_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(tan_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+ # filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_spf_graph <- ggraph(spf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_mm12_graph <- ggraph(mm12_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+#  filter(abs(r) > 0.6) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_gf_graph <- ggraph(gf_graph, circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 0.5, alpha = 0.8) +
+  geom_node_point(size = 2, color = "black") +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(tan_spf_graph, tan_mm12_graph, tan_gf_graph, nrow = 1)
+
+ggsave(tan_spf_graph, file = "export.dir/tan_module_spf.pdf", height = 2.5, width = 3)
+ggsave(tan_mm12_graph, file = "export.dir/tan_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(tan_gf_graph, file = "export.dir/tan_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+## Changes in connectivity
+
+It's very interesting to visualise the changes in network connectivity across the microbiome states but is slightly confusing that the black module which appears quite well preserved is not particularly well preserved when looking at the RNA splicing related genes. There is a bit of a question as to whether this is a network comparison issue in general and should look into this a bit more.
+
+
+```{r fatty acid metabolism genes connectivity, echo = FALSE, message = FALSE}
+
+to_compare_green_cors <- data.frame(SPF = spf_cors$r,
+                                    MM12 = mm12_cors$r,
+                                    GF = gf_cors$r) %>%
+  pivot_longer(cols = everything())
+
+median_spf <- median(to_compare_green_cors$value[to_compare_green_cors$name == "SPF"], na.rm = TRUE)
+median_gf <- median(to_compare_green_cors$value[to_compare_green_cors$name == "GF"], na.rm = TRUE)
+median_mm12 <- median(to_compare_green_cors$value[to_compare_green_cors$name == "MM12"], na.rm = TRUE)
+
+ggplot(to_compare_green_cors, aes(x = value, fill = name)) +
+    geom_vline(xintercept = c(median_spf, median_mm12, median_gf),
+             color = c(group_colours[["SPF"]],
+                       group_colours[["MM12"]],
+                       group_colours[["GF"]]),
+             linetype = "dashed") +
+  geom_density(alpha = 0.5, color = "white") +
+ # geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  scale_fill_manual(values = group_colours)  +
+  theme(legend.position = "none")
+
+ggsave("export.dir/green_module_cors_across_groups.pdf", height = 2.5, width = 2.5)
+
+```
+
+
+## Testing significance of differences
+
+We can test if the correlations between each gene pair is significantly different between groups by using confidence intervals and whether or not they overlap. We can pick out some key examples from this analysis.
+
+```{r fatty acid cis, echo = FALSE, message = FALSE}
+
+ci_fa <- na.omit(compare_cor_ci(t(ileum_exprs_all[green_gois,]),
+               group = ileum_metadata[colnames(ileum_exprs_all),]$status))
+
+ci_fa[order(ci_fa$r, decreasing = TRUE),] 
+
+fa_gois <- c("Apoc2", "Apoc3", "Apoa4", "Acat1", "Faah", "Acaah", "Fabp1")
+
+apoc2_apoc3 <- ci_fa[ci_fa$x == "Apoc2" & ci_fa$y == "Apoc3",]
+apoc2_apoc3_p <- ggplot(apoc2_apoc3, aes(x = group, y = r, color = group)) +
+  geom_point(size = 3) +
+  geom_segment(x = c(1,2,3), y = apoc2_apoc3$lower_ci, xend = c(1,2,3), yend = apoc2_apoc3$upper_ci) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  ylim(c(-0.7, 1))
+
+apoc2_apoa4 <- ci_fa[ci_fa$x == "Apoc2" & ci_fa$y == "Apoa4",]
+apoc2_apoa4_p <- ggplot(apoc2_apoa4, aes(x = group, y = r, color = group)) +
+  geom_point(size = 3) +
+  geom_segment(x = c(1,2,3), y = apoc2_apoa4$lower_ci, xend = c(1,2,3), yend = apoc2_apoa4$upper_ci) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  ylim(c(-0.5, 1))
+
+apoa4_fabp1 <- ci_fa[ci_fa$x == "Apoa4" & ci_fa$y == "Fabp1",]
+apoa4_fabp1_p <- ggplot(apoa4_fabp1, aes(x = group, y = r, color = group)) +
+  geom_point(size = 3) +
+  geom_segment(x = c(1,2,3), y = apoa4_fabp1$lower_ci, xend = c(1,2,3), yend = apoa4_fabp1$upper_ci) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  ylim(c(-0.5, 1))
+
+# and the scatter plots for these
+to_cor_plot_ileum <- ileum_metadata
+for (i in fa_gois){
+  to_cor_plot_ileum[,i] <- unlist(ileum_exprs_all[i, as.character(to_cor_plot_ileum$sampleID)])
+}    
+
+p1 <- ggplot(to_cor_plot_ileum, aes(x = Apoc2, y = Apoc3, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2) +
+  facet_wrap(~status, scales = "free") +
+  theme(legend.position = "none")
+
+# Black module i.e. defensins and tan module B cell activation
+p2 <- ggplot(to_cor_plot_ileum, aes(x = Apoc2, y = Apoa4, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2) +
+  facet_wrap(~status, scales = "free") +
+  theme(legend.position = "none")
+
+p3 <- ggplot(to_cor_plot_ileum, aes(x = Apoa4, y = Fabp1, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2) +
+  facet_wrap(~status, scales = "free") +
+  theme(legend.position = "none")
+
+gridExtra::grid.arrange(p1, apoc2_apoc3_p, p2, apoc2_apoa4_p, p3, apoa4_fabp1_p, nrow = 3)
+
+ggsave(p1, file = "export.dir/apoc2_apoc3.pdf", height = 2.5, width = 5)
+ggsave(p2, file = "export.dir/apoc2_apoa4.pdf", height = 2.5, width = 5)
+ggsave(p3, file = "export.dir/apoa4_fabp1.pdf", height = 2.5, width = 5)
+ggsave(apoc2_apoc3_p + theme(legend.position = "none"), file = "export.dir/apoc2_apoc3_ci.pdf", height = 2.5, width = 2.5)
+ggsave(apoc2_apoa4_p + theme(legend.position = "none"), file = "export.dir/apoc2_apoa4_ci.pdf", height = 2.5, width = 2.5)
+ggsave(apoa4_fabp1_p + theme(legend.position = "none"), file = "export.dir/apoa4_fabp1_ci.pdf", height = 2.5, width = 2.5)
+
+```
+
+This is really nice as the confidence intervals are non-overlapping so we can conclude a difference in correlation strength in the GF vs others (particularly SPF). Also because this is to do with lipid handling we can get make a link to the liver and maybe that should be the next part. Fabp1 pulls back to the fact that this gene is not recovered in the MM12 in initial analyses.
+
+
+
+```{r ileum gois, echo = FALSE, message = FALSE}
+
+# Have a look at the hub genes
+# rownames(ileum_kMEs[order(ileum_kMEs$MEblack, decreasing = TRUE),])[1:10]
+
+# rownames(ileum_kMEs[order(ileum_kMEs$MEtan, decreasing = TRUE),])[1:10]
+
+# feeling is to keep a nice set of BA things - Slc10a2, Slc51a, Slc51b and then
+# link to some defensins - Defa24, Defa30, Defa21, Defa22, Defa36
+# Maybe have as scatterplots? or circle correlation things
+
+# these are kind of just set out in their pairs
+black_gois <- c("Slc10a2", "Slc51a", "Slc51b", "Fabp6",
+                "Defa22", "Defa21",
+                "Defa23", "Defa24",
+                "Defa30") 
+
+tan_gois <-  c("H2-DMb2", "Tnfrsf13c",
+                "Rubcnl", "Fcmr",
+                "Cd79a", "Cd79b",
+               "Cxcl13", "Ighm",
+               "Cd2")
+
+
+to_cor_plot_ileum <- ileum_metadata
+
+# Expression data
+aggy <- geneid2genename[rownames(ileum_normed_dat_corrected),]$gene_name
+ileum_exprs_all <- aggregate(ileum_normed_dat_corrected,
+                             by = list(aggy),
+                             FUN = "mean") %>%
+  column_to_rownames(var = "Group.1")
+
+write.table(data.frame(gene = rownames(ileum_exprs_all), ileum_exprs_all),
+            file = "export.dir/ileum_exprs.tsv",
+            quote = FALSE,
+            sep = "\t")
+
+# can get the CI on the point estimates of correlation
+ileum_gois_exprs <- ileum_exprs_all[black_gois, rownames(ileum_metadata)]
+black_cor_cis <- compare_cor_ci(t(ileum_gois_exprs), ileum_metadata$status)
+
+slc10a2_defa21 <- black_cor_cis[black_cor_cis$x == "Slc10a2" & black_cor_cis$y == "Defa21",]
+ggplot(slc10a2_defa21, aes(x = group, y = r, color = group)) +
+  geom_point(size = 2) +
+  geom_segment(x = c(1,2,3), y = slc10a2_defa21$lower_ci, xend = c(1,2,3), yend = slc10a2_defa21$upper_ci) +
+  theme_classic()
+
+slc10a2_defa22 <- black_cor_cis[black_cor_cis$x == "Slc10a2" & black_cor_cis$y == "Defa22",]
+ggplot(slc10a2_defa22, aes(x = group, y = r, color = group)) +
+  geom_point(size = 2) +
+  geom_segment(x = c(1,2,3), y = slc10a2_defa22$lower_ci, xend = c(1,2,3), yend = slc10a2_defa22$upper_ci) +
+  theme_classic()
+
+
+
+for (i in black_gois){
+  to_cor_plot_ileum[,i] <- unlist(ileum_exprs_all[i, as.character(to_cor_plot_ileum$sampleID)])
+}    
+
+# Black module i.e. defensins and tan module B cell activation
+p1 <- ggplot(to_cor_plot_ileum, aes(x = Slc10a2, y = Defa30, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2) +
+  facet_wrap(~status, scales = "free") +
+  theme(legend.position = "none")
+
+p2 <- ggplot(to_cor_plot_ileum, aes(x = Slc10a2, y = Defa21, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2)+
+  facet_wrap(~status, scales = "free")  +
+  theme(legend.position = "none")
+
+p3 <- ggplot(to_cor_plot_ileum, aes(x = Slc10a2, y = Defa22, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2)+
+  facet_wrap(~status, scales = "free")  +
+  theme(legend.position = "none")
+
+p4 <- ggplot(to_cor_plot_ileum, aes(x = Slc10a2, y = Defa23, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = group_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2)+
+  facet_wrap(~status, scales = "free")  +
+  theme(legend.position = "none")
+
+
+gridExtra::grid.arrange(p1, p2, p3, p4, nrow = 3)
+
+
+ggsave(p1, file = "export.dir/slc10a2_defa30.pdf", height = 2.5, width = 5)
+ggsave(p2, file = "export.dir/slc10a2_defa21.pdf", height = 2.5, width = 5)
+ggsave(p3, file = "export.dir/slc10a2_defa22.pdf", height = 2.5, width = 5)
+ggsave(p4, file = "export.dir/slc10a2_defa23.pdf", height = 2.5, width = 5)
+
+```
+
+
+## Compare correlations
+
+### Black module gois
+
+```{r compare cors, echo = FALSE, message = FALSE}
+
+spf_samples <- rownames(ileum_metadata[ileum_metadata$status == "SPF" & ileum_metadata$age == "Young",])
+mm12_samples <- rownames(ileum_metadata[ileum_metadata$status == "MM12" & ileum_metadata$age == "Young",])
+gf_samples <- rownames(ileum_metadata[ileum_metadata$status == "GF" & ileum_metadata$age == "Young",])
+
+# black gois
+black_spf_exprs <- na.omit(ileum_exprs_all[black_gois, spf_samples])
+black_mm12_exprs <- na.omit(ileum_exprs_all[black_gois, mm12_samples])
+black_gf_exprs <- na.omit(ileum_exprs_all[black_gois, gf_samples])
+
+spf_cors <- correlate(t(black_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(black_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(black_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_spf_graph <- ggraph(spf_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "black") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_mm12_graph <- ggraph(mm12_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "black") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+black_gf_graph <- ggraph(gf_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "black") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(black_spf_graph, black_mm12_graph, black_gf_graph, nrow = 1)
+
+ggsave(black_spf_graph, file = "export.dir/black_module_spf.pdf", height = 2.5, width = 3)
+ggsave(black_mm12_graph, file = "export.dir/black_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(black_gf_graph, file = "export.dir/black_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+### Tan module gois
+
+```{r compare cors tan, echo = FALSE, message = FALSE}
+
+# tan gois
+tan_spf_exprs <- na.omit(ileum_exprs_all[tan_gois, spf_samples])
+tan_mm12_exprs <- na.omit(ileum_exprs_all[tan_gois, mm12_samples])
+tan_gf_exprs <- na.omit(ileum_exprs_all[tan_gois, gf_samples])
+
+spf_cors <- correlate(t(tan_spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(tan_mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(tan_gf_exprs)) %>%
+  stretch()
+
+spf_graph <- spf_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_spf_graph <- ggraph(spf_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "tan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void()
+
+mm12_graph <- mm12_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_mm12_graph <- ggraph(mm12_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "tan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void() 
+
+gf_graph <- gf_cors %>% 
+  filter(abs(r) > 0.5) %>%
+  graph_from_data_frame(directed = FALSE)
+
+tan_gf_graph <- ggraph(gf_graph, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "tan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient(low = "snow2", high = "red", limits = c(0.5, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(tan_spf_graph, tan_mm12_graph, tan_gf_graph, nrow = 1)
+
+ggsave(tan_spf_graph, file = "export.dir/tan_module_spf.pdf", height = 2.5, width = 3)
+ggsave(tan_mm12_graph, file = "export.dir/tan_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(tan_gf_graph, file = "export.dir/tan_module_gf.pdf", height = 2.5, width = 3)
+```
+
+
+## Write supplemental
+
+```{r write module pathways, echo = FALSE, message = FALSE}
+
+
+ileum_results$go_results$darkgrey@result$module <- "ILE1_darkgrey"
+ileum_results$go_results$red@result$module <- "ILE2_red"
+ileum_results$go_results$tan@result$module <- "ILE3_tan"
+ileum_results$go_results$darkorange@result$module <- "ILE4_darkorange"
+ileum_results$go_results$black@result$module <- "ILE5_black"
+ileum_results$go_results$blue@result$module <- "ILE6_blue"
+ileum_results$go_results$purple@result$module <- "ILE7_purple"
+ileum_results$go_results$grey60@result$module <- "ILE8_grey60"
+ileum_results$go_results$greenyellow@result$module <- "ILE9_greenyellow"
+ileum_results$go_results$brown@result$module <- "ILE10_brown"
+ileum_results$go_results$green@result$module <- "ILE11_green"
+ileum_results$go_results$darkgreen@result$module <- "ILE12_darkgreen"
+ileum_results$go_results$white@result$module <- "ILE13_white"
+ileum_results$go_results$darkred@result$module <- "ILE14_darkred"
+ileum_results$go_results$orange@result$module <- "ILE15_orange"
+ileum_results$go_results$cyan@result$module <- "ILE16_cyen"
+ileum_results$go_results$lightyellow@result$module <- "ILE17_lightyellow"
+ileum_results$go_results$steelblue@result$module <- "ILE18_steelblue"
+ileum_results$go_results$skyblue@result$module <- "ILE19_skyblue"
+
+to_bind <- list()
+for (i in 1:length(ileum_results$go_results)){
+  res <- as.data.frame(ileum_results$go_results[[i]]@result)
+  to_bind[[i]] <- res
+}
+
+ileum_module_go_results <- bind_rows(to_bind)
+
+write.table(ileum_module_go_results, 
+            file = "export.dir/fora_ileum_modules.tsv",
+            row.names = FALSE,
+            quote = FALSE,
+            sep = "\t")
+
+```
+
+
+
+
+## Liver gois
+
+The next step is to look at the liver modules in the same way. We have observed that the brown module is not well preserved in MM12 but is well preserved in GF - this module contains genes involved in bile acid processing so could be a nice link to the bile acid transport things seen in the ileum. Examples that are preserved are the magenta module which is a lot of ribosomal proteins so very broad translational function.
+
+
+```{r liver gois, echo = FALSE, message = FALSE}
+
+
+# these are kind of just set out in their pairs
+# magenta genes on enriched pathways
+magenta_gois <- unlist(strsplit(liver_results$go_results$magenta[1,]$geneID, "/"))[1:10]
+
+brown_gois <- unlist(strsplit(liver_results$go_results$brown[4,]$geneID, "/", ))
+brown_gois <- brown_gois[grep("Slc|Cyp", brown_gois)]
+
+
+to_cor_plot_liver <- liver_metadata
+
+# Expression data
+aggy_liver <- geneid2genename[rownames(liver_normed_dat),]$gene_name
+liver_exprs_all <- aggregate(liver_normed_dat,
+                             by = list(aggy_liver),
+                             FUN = "mean") %>%
+  column_to_rownames(var = "Group.1")
+
+for (i in brown_gois){
+  to_cor_plot_liver[,i] <- unlist(liver_exprs_all[i, to_cor_plot_liver$sampleID])
+}    
+
+# brown module 
+p1_liv <- ggplot(to_cor_plot_liver, aes(x = Slc27a5, y = Slc27a4, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = liver_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2) +
+  facet_wrap(~status, scales = "free") +
+  theme(legend.position = "none")
+
+ p2_liv <- ggplot(to_cor_plot_liver, aes(x = Slc27a4, y = Cyp2d10, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = liver_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2)+
+  facet_wrap(~status, scales = "free")  +
+  theme(legend.position = "none")
+
+p3_liv <- ggplot(to_cor_plot_liver, aes(x = Slc27a4, y = Cyp2d10, color = status)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  scale_color_manual(values = liver_colours) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor(size = 2)+
+  facet_wrap(~status, scales = "free")  +
+  theme(legend.position = "none")
+
+gridExtra::grid.arrange(p1_liv, p2_liv, p3_liv, nrow = 3)
+
+ggsave(p1_liv, file = "export.dir/slc27a4_slc27a5.pdf", height = 2.5, width = 5)
+ggsave(p2_liv, file = "export.dir/slc27a4_cyp27a1.pdf", height = 2.5, width = 5)
+ggsave(p3_liv, file = "export.dir/slc27a4_cyp2d10.pdf", height = 2.5, width = 5)
+
+```
+
+
+### Compare correlations liver
+
+```{r compare brown module genes, echo = FALSE, message = FALSE}
+
+spf_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "SPF"]
+mm12_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "MM12"]
+gf_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "GF"]
+
+# tan gois
+brown_spf_exprs <- na.omit(liver_exprs_all[brown_gois, spf_samples_liver])
+brown_mm12_exprs <- na.omit(liver_exprs_all[brown_gois, mm12_samples_liver])
+brown_gf_exprs <- na.omit(liver_exprs_all[brown_gois, gf_samples_liver])
+
+spf_cors_liver <- correlate(t(brown_spf_exprs)) %>%
+  stretch()
+mm12_cors_liver <- correlate(t(brown_mm12_exprs)) %>%
+  stretch()
+gf_cors_liver <- correlate(t(brown_gf_exprs)) %>%
+  stretch()
+
+spf_graph_liver <- spf_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+brown_spf_graph <- ggraph(spf_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "brown") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph_liver <- mm12_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+brown_mm12_graph <- ggraph(mm12_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "brown") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph_liver <- gf_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+brown_gf_graph <- ggraph(gf_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "brown") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(brown_spf_graph, brown_mm12_graph, brown_gf_graph, nrow = 1)
+
+ggsave(brown_spf_graph, file = "export.dir/brown_module_spf.pdf", height = 2.5, width = 3)
+ggsave(brown_mm12_graph, file = "export.dir/brown_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(brown_gf_graph, file = "export.dir/brown_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+## Liver light cyan
+
+Trying to buld up a story around ECM as is associated also with F. dunncaniae.
+
+
+```{r compare lightcyan module genes, echo = FALSE, message = FALSE}
+
+lightcyan_gois <- unlist(strsplit(liver_results$go_results$lightcyan[1,]$geneID, "/"))[1:10]
+
+spf_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "SPF"]
+mm12_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "MM12"]
+gf_samples_liver <- to_cor_plot_liver$sampleID[as.character(to_cor_plot_liver$status) == "GF"]
+
+# lightcyan gois
+lightcyan_spf_exprs <- na.omit(liver_exprs_all[lightcyan_gois, spf_samples_liver])
+lightcyan_mm12_exprs <- na.omit(liver_exprs_all[lightcyan_gois, mm12_samples_liver])
+lightcyan_gf_exprs <- na.omit(liver_exprs_all[lightcyan_gois, gf_samples_liver])
+
+spf_cors_liver <- correlate(t(lightcyan_spf_exprs)) %>%
+  stretch()
+mm12_cors_liver <- correlate(t(lightcyan_mm12_exprs)) %>%
+  stretch()
+gf_cors_liver <- correlate(t(lightcyan_gf_exprs)) %>%
+  stretch()
+
+spf_graph_liver <- spf_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+lightcyan_spf_graph <- ggraph(spf_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "lightcyan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void()
+
+mm12_graph_liver <- mm12_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+lightcyan_mm12_graph <- ggraph(mm12_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "lightcyan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gf_graph_liver <- gf_cors_liver %>% 
+  filter(abs(r) > 0.4) %>%
+  graph_from_data_frame(directed = FALSE)
+
+lightcyan_gf_graph <- ggraph(gf_graph_liver, layout = "linear", circular = TRUE) +
+  geom_edge_arc(aes(color = r), width = 2, alpha = 0.8) +
+  geom_node_point(size = 6, color = "lightcyan") +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  coord_fixed() +
+  scale_edge_color_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  theme_void() 
+
+gridExtra::grid.arrange(lightcyan_spf_graph, lightcyan_mm12_graph, lightcyan_gf_graph, nrow = 1)
+
+ggsave(brown_spf_graph, file = "export.dir/brown_module_spf.pdf", height = 2.5, width = 3)
+ggsave(brown_mm12_graph, file = "export.dir/brown_module_mm12.pdf", height = 2.5, width = 3)
+ggsave(brown_gf_graph, file = "export.dir/brown_module_gf.pdf", height = 2.5, width = 3)
+
+```
+
+
+
+
+```{r}
+
+library(corrr)
+
+spf_exprs <- na.omit(ileum_exprs_all[, spf_samples])
+mm12_exprs <- na.omit(ileum_exprs_all[, mm12_samples])
+gf_exprs <- na.omit(ileum_exprs_all[, gf_samples])
+
+spf_cors <- correlate(t(spf_exprs)) %>%
+  stretch()
+mm12_cors <- correlate(t(mm12_exprs)) %>%
+  stretch()
+gf_cors <- correlate(t(gf_exprs)) %>%
+  stretch()
+
+# get the Defa22 cors
+spf_defa22 <- subset(spf_cors, subset = x == "Defa22")
+mm12_defa22 <- subset(mm12_cors, subset = x == "Defa22")
+gf_defa22 <- subset(gf_cors, subset = x == "Defa22")
+
+to_cor <- data.frame(x = spf_defa22$x,
+                     y = spf_defa22$y,
+                     spf = spf_defa22$r,
+                     mm12 = mm12_defa22$r,
+                     gf = gf_defa22$r)
+
+spf_mm12 <- ggplot(to_cor, aes(x = spf, y = mm12)) +
+  geom_point(size = 0.1) +
+  theme_classic() 
+
+spf_gf <- ggplot(to_cor, aes(x = spf, y = gf)) +
+  geom_point(size = 0.1) +
+  theme_classic() 
+
+mm12_gf <- ggplot(to_cor, aes(x = mm12, y = gf)) +
+  geom_point(size = 0.1) +
+  theme_classic() 
+
+
+gridExtra::grid.arrange(spf_mm12, spf_gf, mm12_gf, nrow = 1)
+
+all_defa22 <- bind_cols(spf_defa22, mm12_defa22, gf_defa22)
+colnames(all_defa22) <- c("gene.1", "gene.2", "SPF", "gene.1", "gene.2", "MM12", "gene.1", "gene.2","GF")
+
+all_defa22[all_defa22$SPF < 0.5 & all_defa22$GF < 0.5 & all_defa22$MM12 > 0.7,]
+
+```
+
+
+
+
+```{r enrichment heatmaps,  echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.width=8.27, fig.height=12, fig.align='center'}
+library(ggplot2)
+library(reshape2)
+library(viridis)
+library(patchwork)
+
+create_summary_heatmap_ggplot <- function(summary_df, tissue_name = "Tissue", top_n = 100) {
+  if (nrow(summary_df) == 0) stop("Summary dataframe is empty")
+  
+  pvalue_matrix <- acast(summary_df, GOterm ~ Module, value.var = "Pvalue", fill = 1)
+  pvalue_matrix_log <- -log10(pvalue_matrix)
+  
+  if (nrow(pvalue_matrix_log) > top_n) {
+    top_terms <- names(sort(apply(pvalue_matrix_log, 1, max), decreasing = TRUE)[1:top_n])
+    pvalue_matrix_log <- pvalue_matrix_log[top_terms, ]
+  }
+  
+  df_long <- melt(pvalue_matrix_log)
+  colnames(df_long) <- c("GOterm", "Module", "logP")
+  
+  # Convert to character and fix specific term
+  df_long$GOterm <- as.character(df_long$GOterm)
+  df_long$GOterm[df_long$GOterm == "adaptive immune response based on somatic recombination of immune receptors built from immunoglobula-superamila dovation"] <- "Adaptive Immune Response (Somatic Recombination)"
+  
+  # Apply proper capitalization
+  df_long$GOterm <- tools::toTitleCase(tolower(df_long$GOterm))
+  
+  df_long$GOterm <- factor(df_long$GOterm, levels = rev(unique(df_long$GOterm)))
+  
+  p <- ggplot(df_long, aes(x = Module, y = GOterm, fill = logP)) +
+    geom_tile(color = "black", linewidth = 0.1, width = 1, height = 1.3) +
+    scale_fill_viridis(
+      name = expression(-log[10](italic(p))),
+      option = "plasma",
+      direction = 1,
+      limits = c(0, max(df_long$logP, na.rm = TRUE)),
+      oob = scales::squish
+    ) +
+    theme_minimal(base_size = 10) +
+    labs(title = paste(tissue_name, "- GO Term Enrichment by Module"),
+         x = "Module", y = "GO Term") +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+      legend.position = "bottom",
+      legend.key.width = unit(2, "cm"),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 10),
+      plot.margin = margin(10, 10, 10, 10),
+      panel.spacing = unit(3, "lines")
+    )
+  
+  return(p)
+}
+
+
+ileum_results$summary$GOterm[ileum_results$summary$GOterm == "adaptive immune response based on somatic recombination of immune receptors built from immunoglobulin superfamily domains"] <- "adaptive immune response (somatic recombination)"
+
+p_ileum <- create_summary_heatmap_ggplot(ileum_results$summary, "Ileum")
+p_liver <- create_summary_heatmap_ggplot(liver_results$summary, "Liver")
+
+# Combine with larger relative space and exportable layout
+combined_plot <- p_ileum / p_liver + plot_layout(heights = c(1, 1))
+combined_plot
+```
+
+
+
+
+
+
+
+max_z <- max(preservation_comparison_ileum$Z_GF, preservation_comparison_ileum$Z_MM12, na.rm = TRUE) * 1.1
+p2 <- ggplot(preservation_comparison_ileum) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 2, ymax = 10, 
+           fill = "lightpink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 2, ymax = 10, 
+           fill = "lightblue", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 2, ymax = 10, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 10, ymax = Inf, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 10, ymax = Inf, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 10, ymax = Inf, 
+           fill = "lightgreen", alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", size = 0.4) +
+  geom_point(aes(x = Z_GF, y = Z_MM12, size = ModuleSize), 
+             color = "darkblue", alpha = 0.7) +
+  geom_text_repel(aes(x = Z_GF, y = Z_MM12, label = str_wrap(GOterm, 15)),
+                  size = 3, max.overlaps = 30, box.padding = 0.4,
+                  point.padding = 0.3, segment.color = "grey50") +
+  geom_vline(xintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  geom_hline(yintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  scale_size_continuous(range = c(2, 5), name = "Module\nSize") +
+  labs(x = "GF Preservation Z-score", y = "MM12 Preservation Z-score",
+       title = "A. GF vs MM12 Preservation Comparison") +
+  theme_custom +
+  theme(legend.position = "right") +
+  coord_fixed(ratio = 1, xlim = c(0, max_z), ylim = c(0, max_z))
+
+heatmap_data_detailed <- preservation_comparison_ileum %>%
+  dplyr::select(GOterm, Z_GF, GF_Coexpression, GF_HubStability, Z_MM12, MM12_Coexpression, MM12_HubStability) %>%
+  rename(GF_Overall = Z_GF, MM12_Overall = Z_MM12) %>%
+  mutate(GOterm = str_wrap(GOterm, width = 25)) %>%
+  melt(id.vars = "GOterm", variable.name = "Metric", value.name = "Score") %>%
+  separate(Metric, into = c("Condition", "Type"), sep = "_") %>%
+  mutate(Type = case_when(
+    Type == "Overall" ~ "Overall",
+    Type == "Coexpression" ~ "Co-exp",
+    Type == "HubStability" ~ "Hub Stab"
+  )) %>%
+  mutate(Metric = paste(Condition, Type, sep = "\n"))
+
+p4 <- ggplot(heatmap_data_detailed, aes(x = Metric, y = reorder(GOterm, Score), fill = Score)) +
+  geom_tile(color = "white", size = 0.2) +
+  scale_fill_gradient2(low = "navy", mid = "white", high = "darkred", 
+                       midpoint = 0, na.value = "grey",
+                       name = "Score") +
+  labs(x = NULL, y = NULL, title = "B. Detailed Preservation Heatmap") +
+  theme_custom +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "right")
+
+combined_plot <- (
+  p2 /
+  p4
+) + 
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(
+    title = NULL,
+    theme = theme(plot.title = element_text(size = 13, face = "bold", hjust = 0.5))
+  )
+
+print(combined_plot)
+```
+
+```{r module preservation visualisation liver, echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.width=8.27, fig.height=11.69, fig.align='center'}
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(stringr)
+library(reshape2)
+library(patchwork)
+
+theme_custom <- theme_bw() +
+  theme(
+    text = element_text(size = 20),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20),
+    legend.key.size = unit(0.6, "cm"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 20)
+  )
+
+
+max_z <- max(preservation_comparison_liver$Z_GF, preservation_comparison_liver$Z_MM12, na.rm = TRUE) * 1.1
+
+p2 <- ggplot(preservation_comparison_liver) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = -Inf, ymax = 2, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 2, ymax = 10, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 2, ymax = 10, 
+           fill = "lightblue", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 2, ymax = 10, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 10, ymax = Inf, 
+           fill = "pink", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 10, ymax = Inf, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 10, ymax = Inf, 
+           fill = "lightgreen", alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", size = 0.4) +
+  geom_point(aes(x = Z_GF, y = Z_MM12, size = ModuleSize), 
+             color = "darkblue", alpha = 0.7) +
+  geom_text_repel(aes(x = Z_GF, y = Z_MM12, label = str_wrap(GOterm, 15)),
+                  size = 3, max.overlaps = 30, box.padding = 0.4,
+                  point.padding = 0.3, segment.color = "grey50") +
+  geom_vline(xintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  geom_hline(yintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  scale_size_continuous(range = c(2, 5), name = "Module\nSize") +
+  labs(x = "GF Preservation Z-score", y = "MM12 Preservation Z-score",
+       title = "A. GF vs MM12 Preservation Comparison") +
+  theme_custom +
+  theme(legend.position = "right") +
+  coord_fixed(ratio = 1, xlim = c(0, max_z), ylim = c(0, max_z))
+
+
+heatmap_data_detailed <- preservation_comparison_liver %>%
+  dplyr::select(GOterm, Z_GF, GF_Coexpression, GF_HubStability, Z_MM12, MM12_Coexpression, MM12_HubStability) %>%
+  rename(GF_Overall = Z_GF, MM12_Overall = Z_MM12) %>%
+  mutate(GOterm = str_wrap(GOterm, width = 25)) %>%
+  melt(id.vars = "GOterm", variable.name = "Metric", value.name = "Score") %>%
+  separate(Metric, into = c("Condition", "Type"), sep = "_") %>%
+  mutate(Type = case_when(
+    Type == "Overall" ~ "Overall",
+    Type == "Coexpression" ~ "Co-exp",
+    Type == "HubStability" ~ "Hub Stab"
+  )) %>%
+  mutate(Metric = paste(Condition, Type, sep = "\n"))
+
+p4 <- ggplot(heatmap_data_detailed, aes(x = Metric, y = reorder(GOterm, Score), fill = Score)) +
+  geom_tile(color = "white", size = 0.2) +
+  scale_fill_gradient2(low = "navy", mid = "white", high = "darkred", 
+                       midpoint = 0, na.value = "grey",
+                       name = "Score") +
+  labs(x = NULL, y = NULL, title = "B. Detailed Preservation Heatmap") +
+  theme_custom +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "right")
+
+combined_plot <- (
+  p2 /
+  p4
+) + 
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(
+    title = NULL,
+    theme = theme(plot.title = element_text(size = 13, face = "bold", hjust = 0.5))
+  )
+
+print(combined_plot)
+
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(stringr)
+library(reshape2)
+library(patchwork)
+
+theme_custom <- theme_bw() +
+  theme(
+    text = element_text(size = 20),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20),
+    legend.key.size = unit(0.6, "cm"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 20)
+  )
+
+
+max_z <- max(preservation_comparison_liver$Z_GF, preservation_comparison_liver$Z_MM12, na.rm = TRUE) * 1.1
+
+p2 <- ggplot(preservation_comparison_liver) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = -Inf, ymax = 2, 
+           fill = "lightcoral", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = -Inf, ymax = 2, 
+           fill = "lightsalmon", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = -Inf, ymax = 2, 
+           fill = "mistyrose", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 2, ymax = 10, 
+           fill = "lightsalmon", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 2, ymax = 10, 
+           fill = "lightblue", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 2, ymax = 10, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = 2, ymin = 10, ymax = Inf, 
+           fill = "mistyrose", alpha = 0.3) +
+  annotate("rect", xmin = 2, xmax = 10, ymin = 10, ymax = Inf, 
+           fill = "lightcyan", alpha = 0.3) +
+  annotate("rect", xmin = 10, xmax = Inf, ymin = 10, ymax = Inf, 
+           fill = "lightgreen", alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", size = 0.4) +
+  geom_point(aes(x = Z_GF, y = Z_MM12, size = ModuleSize), 
+             color = "darkblue", alpha = 0.7) +
+  geom_text_repel(aes(x = Z_GF, y = Z_MM12, label = str_wrap(GOterm, 15)),
+                  size = 3, max.overlaps = 30, box.padding = 0.4,
+                  point.padding = 0.3, segment.color = "grey50") +
+  geom_vline(xintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  geom_hline(yintercept = c(2, 10), linetype = "dashed", color = "darkred", size = 0.4) +
+  scale_size_continuous(range = c(2, 5), name = "Module\nSize") +
+  labs(x = "GF Preservation Z-score", y = "MM12 Preservation Z-score",
+       title = "A. GF vs MM12 Preservation Comparison") +
+  theme_custom +
+  theme(legend.position = "right") +
+  coord_fixed(ratio = 1, xlim = c(0, max_z), ylim = c(0, max_z))
+
+
+heatmap_data_detailed <- preservation_comparison_liver %>%
+  dplyr::select(GOterm, Z_GF, GF_Coexpression, GF_HubStability, Z_MM12, MM12_Coexpression, MM12_HubStability) %>%
+  rename(GF_Overall = Z_GF, MM12_Overall = Z_MM12) %>%
+  mutate(GOterm = str_wrap(GOterm, width = 25)) %>%
+  melt(id.vars = "GOterm", variable.name = "Metric", value.name = "Score") %>%
+  separate(Metric, into = c("Condition", "Type"), sep = "_") %>%
+  mutate(Type = case_when(
+    Type == "Overall" ~ "Overall",
+    Type == "Coexpression" ~ "Co-exp",
+    Type == "HubStability" ~ "Hub Stab"
+  )) %>%
+  mutate(Metric = paste(Condition, Type, sep = "\n"))
+
+p4 <- ggplot(heatmap_data_detailed, aes(x = Metric, y = reorder(GOterm, Score), fill = Score)) +
+  geom_tile(color = "white", size = 0.2) +
+  scale_fill_gradient2(low = "navy", mid = "white", high = "darkred", 
+                       midpoint = 0, na.value = "grey",
+                       name = "Score") +
+  labs(x = NULL, y = NULL, title = "B. Detailed Preservation Heatmap") +
+  theme_custom +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "right")
+
+combined_plot <- (
+  p2 /
+  p4
+) + 
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(
+    title = NULL,
+    theme = theme(plot.title = element_text(size = 13, face = "bold", hjust = 0.5))
+  )
+
+print(combined_plot)
+```
+
+Finally, we wanted to understand how these module eigengenes mapped across cell types. Using the same publicly available single cell dataset used for deconvolution, we projected the module eigengenes onto the single cell data to determine which cell types were likely to present with those co-expression patterns. In the ileum (Fig X), we saw that the immune eigengene was enriched across immune cell types, RNA processing was present across enterocytes and B cylcing cells primarily, whereas sterol and lipid metabolism occured across a lower degree in endothelial cells. In the liver (Fig X), we saw that the immune associated as well as the antigen processing eigengenes were more widely expressed in myeloid cell types, where as cell cycle and lipid metabolic eigengenes were found more in cholangiocytes and endothelial cells
+
+```{r load data single cell ,echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+library(Seurat)
+data <- readRDS('/well/powrie/shared/scrnaseq_shen/whole_final_annotation.rds')
+
+#ILEUM
+
+ileum_sc <- subset(data, subset = tissue == 'ileum')
+
+Idents(ileum_sc) <- ileum_sc@meta.data$celltypes
+
+#LIVER
+
+liver_sc <- subset(data, subset = tissue == 'liver')
+
+Idents(liver_sc) <- liver_sc@meta.data$celltypes
+
+```
+```{r ileum eigengene, echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.width=8.27, fig.height=11.69, fig.align='center'}
+ileum_cell_counts <- table(ileum_sc$celltypes)
+ileum_celltypes_to_keep <- names(ileum_cell_counts[ileum_cell_counts >= 50])
+ileum_sc <- subset(ileum_sc, subset = celltypes %in% ileum_celltypes_to_keep)
+# Get the gene names from your WGCNA input data
+gene_names_ileum <- colnames(ileum_counts_t_spf)
+
+# Create the mapping
+colours_df <- data.frame(
+  gene = gene_names_ileum,
+  color = mergedColors_spf
+)
+
+
+# Extract genes for each module
+magenta_modules <- colours_df[colours_df$color == 'steelblue', ]$gene
+lightgreen_modules <- colours_df[colours_df$color == 'turquoise', ]$gene
+red_modules <- colours_df[colours_df$color == 'magenta', ]$gene
+white_modules <- colours_df[colours_df$color == 'white', ]$gene
+
+# Get assay data
+ileum_matrix <- GetAssayData(ileum_sc, layer = 'data', assay = 'RNA')
+
+# Calculate metagenes
+magenta_metagene <- colMeans(ileum_matrix[magenta_modules[magenta_modules %in% rownames(ileum_matrix)],])
+lightgreen_metagene <- colMeans(ileum_matrix[lightgreen_modules[lightgreen_modules %in% rownames(ileum_matrix)],])
+red_metagene <- colMeans(ileum_matrix[red_modules[red_modules %in% rownames(ileum_matrix)],])
+white_metagene <- colMeans(ileum_matrix[white_modules[white_modules %in% rownames(ileum_matrix)],])
+
+# Add as metadata
+ileum_sc <- AddMetaData(ileum_sc, metadata = magenta_metagene, col.name = 'Immune Eigengene')
+ileum_sc <- AddMetaData(ileum_sc, metadata = lightgreen_metagene, col.name = 'RNA Processing Eigengene')
+ileum_sc <- AddMetaData(ileum_sc, metadata = red_metagene, col.name = 'Sterol Metabolism Eigengene')
+ileum_sc <- AddMetaData(ileum_sc, metadata = white_metagene, col.name = 'Lipid Metabolism Eigengene')
+
+p1 <- VlnPlot(ileum_sc, features = c('Immune Eigengene', 'RNA Processing Eigengene', 'Sterol Metabolism Eigengene', 'Lipid Metabolism Eigengene'), 
+        group.by = 'celltypes', ncol = 2)
+  
+```
+```{r liver eigengene, echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.width=8.27, fig.height=11.69, fig.align='center'}
+liver_cell_counts <- table(liver_sc$celltypes)
+liver_celltypes_to_keep <- names(liver_cell_counts[liver_cell_counts >= 50])
+liver_sc <- subset(liver_sc, subset = celltypes %in% liver_celltypes_to_keep)
+# Get the gene names from your WGCNA input data
+gene_names_liver <- colnames(liver_counts_t_spf)
+
+# Create the mapping
+colours_df <- data.frame(
+  gene = gene_names_liver,
+  color = mergedColors_spf_liver
+)
+
+# Extract genes for each module
+brown_modules <- colours_df[colours_df$color == 'yellow', ]$gene
+black_modules <- colours_df[colours_df$color == 'green', ]$gene
+red_modules <- colours_df[colours_df$color == 'purple', ]$gene
+greenyellow_modules <- colours_df[colours_df$color == 'red', ]$gene
+
+# Get assay data
+liver_matrix <- GetAssayData(liver_sc, layer = 'data', assay = 'RNA')
+
+# Calculate metagenes
+brown_metagene <- colMeans(liver_matrix[brown_modules[brown_modules %in% rownames(liver_matrix)], , drop = FALSE])
+black_metagene <- colMeans(liver_matrix[black_modules[black_modules %in% rownames(liver_matrix)], , drop = FALSE])
+red_metagene <- colMeans(liver_matrix[red_modules[red_modules %in% rownames(liver_matrix)], , drop = FALSE])
+greenyellow_metagene <- colMeans(liver_matrix[greenyellow_modules[greenyellow_modules %in% rownames(liver_matrix)], , drop = FALSE])
+
+# Add as metadata
+liver_sc <- AddMetaData(liver_sc, metadata = brown_metagene, col.name = 'Cell Cycle Eigengene')
+liver_sc <- AddMetaData(liver_sc, metadata = black_metagene, col.name = 'Immune Eigengene')
+liver_sc <- AddMetaData(liver_sc, metadata = red_metagene, col.name = 'Lipid Metabolic Eigengene')
+liver_sc <- AddMetaData(liver_sc, metadata = greenyellow_metagene, col.name = 'Antigen Processing Eigengene')
+
+p2<- VlnPlot(liver_sc, features = c('Cell Cycle Eigengene', 'Immune Eigengene', 'Lipid Metabolic Eigengene', 'Antigen Processing Eigengene'), 
+        group.by = 'celltypes', ncol = 2)
+```
+
+All together, WGCNA has identified modlue eigenegenes that are both preserved and lost across MM12 and GF mice, further colouring the landscape of altered gene expression driven by the microbiome.
+
+
+```{r deseq vs wgcna}
+extract_deg <- function(deseq_obj) {
+  rownames(deseq_obj$deseq[deseq_obj$deseq$padj < 0.05, , drop = FALSE])
+}
+
+ensure_named_colors <- function(colors, mat_t) {
+  colors <- as.character(colors)
+  if (is.null(names(colors)) || !all(nzchar(names(colors)))) names(colors) <- colnames(mat_t)
+  colors
+}
+
+deg_fraction <- function(modules_df, color_vec, deg_vec) {
+  cols <- as.character(color_vec)
+  genes <- names(color_vec)
+  sapply(as.character(modules_df$Module), function(m) {
+    g <- genes[cols == m]
+    if (!length(g)) return(NA_real_)
+    mean(g %in% deg_vec)
+  })
+}
+
+deg_spf_vs_gf_ileum <- extract_deg(results$Ileum_SPF_vs_GF)
+deg_spf_vs_mm12_ileum <- extract_deg(results$Ileum_SPF_vs_MM12)
+deg_gf_vs_mm12_ileum <- extract_deg(results$Ileum_GF_vs_MM12)
+
+deg_spf_vs_gf_liver <- extract_deg(results$Liver_SPF_vs_GF)
+deg_spf_vs_mm12_liver <- extract_deg(results$Liver_SPF_vs_MM12)
+deg_gf_vs_mm12_liver <- extract_deg(results$Liver_GF_vs_MM12)
+
+mergedColors_spf <- ensure_named_colors(mergedColors_spf, ileum_counts_t_spf)
+mergedColors_spf_liver <- ensure_named_colors(mergedColors_spf_liver, liver_counts_t_spf)
+
+preservation_comparison_ileum$Module <- as.character(preservation_comparison_ileum$Module)
+preservation_comparison_liver$Module <- as.character(preservation_comparison_liver$Module)
+
+preservation_comparison_ileum$DEG_frac_SPFvsGF <- deg_fraction(preservation_comparison_ileum, mergedColors_spf, deg_spf_vs_gf_ileum)
+preservation_comparison_ileum$DEG_frac_SPFvsMM12 <- deg_fraction(preservation_comparison_ileum, mergedColors_spf, deg_spf_vs_mm12_ileum)
+preservation_comparison_ileum$DEG_frac_GFvsMM12 <- deg_fraction(preservation_comparison_ileum, mergedColors_spf, deg_gf_vs_mm12_ileum)
+
+preservation_comparison_liver$DEG_frac_SPFvsGF <- deg_fraction(preservation_comparison_liver, mergedColors_spf_liver, deg_spf_vs_gf_liver)
+preservation_comparison_liver$DEG_frac_SPFvsMM12 <- deg_fraction(preservation_comparison_liver, mergedColors_spf_liver, deg_spf_vs_mm12_liver)
+preservation_comparison_liver$DEG_frac_GFvsMM12 <- deg_fraction(preservation_comparison_liver, mergedColors_spf_liver, deg_gf_vs_mm12_liver)
+
+preservation_threshold <- 10
+
+analyze <- function(tbl, z_col, deg_col, threshold) {
+  deg <- tbl[[deg_col]]
+  z <- tbl[[z_col]]
+  preserved <- z >= threshold
+  list(
+    correlation = suppressWarnings(cor.test(deg, z, method = "spearman")),
+    wilcox = suppressWarnings(wilcox.test(deg[preserved], deg[!preserved])),
+    summary_stats = list(
+      mean_preserved = mean(deg[preserved], na.rm = TRUE),
+      median_preserved = median(deg[preserved], na.rm = TRUE),
+      iqr_preserved = IQR(deg[preserved], na.rm = TRUE),
+      mean_nonpreserved = mean(deg[!preserved], na.rm = TRUE),
+      median_nonpreserved = median(deg[!preserved], na.rm = TRUE),
+      iqr_nonpreserved = IQR(deg[!preserved], na.rm = TRUE)
+    )
+  )
+}
+
+list(
+  Ileum_SPF_vs_GF = analyze(preservation_comparison_ileum, "Z_GF", "DEG_frac_SPFvsGF", preservation_threshold),
+  Ileum_SPF_vs_MM12 = analyze(preservation_comparison_ileum, "Z_MM12", "DEG_frac_SPFvsMM12", preservation_threshold),
+  Liver_SPF_vs_GF = analyze(preservation_comparison_liver, "Z_GF", "DEG_frac_SPFvsGF", preservation_threshold),
+  Liver_SPF_vs_MM12 = analyze(preservation_comparison_liver, "Z_MM12", "DEG_frac_SPFvsMM12", preservation_threshold)
+)
+
+
+```
+
+```{r scatter}
+library(dplyr)
+
+set.seed(42)
+
+get_top_diff_pairs_prefiltered <- function(normed_data, results_list, tissue_prefix, n_pairs = 10000, top_n = 5, pval_cutoff = 0.05, var_cutoff = 0.5) {
+  cat("Selecting samples for tissue:", tissue_prefix, "\n")
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  mm12_samples <- grep(paste0("^", tissue_prefix, "(", paste(61:75, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  gf_samples <- grep(paste0("^", tissue_prefix, "(", paste(76:90, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  cat(length(spf_samples), "SPF samples,", length(mm12_samples), "MM12 samples,", length(gf_samples), "GF samples selected\n\n")
+  
+  cat("Processing normalized data for differential gene expression filtering\n")
+  normed_processed <- process_deseq_results(as.data.frame(normed_data[, c(spf_samples, mm12_samples, gf_samples)]), offline = TRUE)
+  normed_processed <- normed_processed$res[1:(length(normed_processed$res)-1)]
+  
+  deg_spf_vs_gf <- results_list[[paste0(tissue_prefix, "_SPF_vs_GF")]]$deseq
+  deg_spf_vs_mm12 <- results_list[[paste0(tissue_prefix, "_SPF_vs_MM12")]]$deseq
+  
+  deg_genes_gf <- rownames(deg_spf_vs_gf)[deg_spf_vs_gf$padj < pval_cutoff & !is.na(deg_spf_vs_gf$padj)]
+  deg_genes_mm12 <- rownames(deg_spf_vs_mm12)[deg_spf_vs_mm12$padj < pval_cutoff & !is.na(deg_spf_vs_mm12$padj)]
+  
+  deg_genes <- union(deg_genes_gf, deg_genes_mm12)
+  
+  genes_in_data <- rownames(normed_processed)
+  genes_keep <- intersect(genes_in_data, deg_genes)
+  cat(length(genes_keep), "genes pass DEG filtering (padj <", pval_cutoff, ")\n")
+  
+  # Filter by variance across SPF samples to keep only variable genes
+  spf_expr <- normed_processed[genes_keep, spf_samples, drop = FALSE]
+  gene_vars <- apply(spf_expr, 1, var)
+  genes_var_filtered <- names(gene_vars)[gene_vars >= var_cutoff]
+  cat(length(genes_var_filtered), "genes pass variance filtering (var >=", var_cutoff, ")\n\n")
+  
+  normed_processed_filtered <- normed_processed[genes_var_filtered, ]
+  
+  spf_expr <- t(normed_processed_filtered[, spf_samples])
+  mm12_expr <- t(normed_processed_filtered[, mm12_samples])
+  gf_expr <- t(normed_processed_filtered[, gf_samples])
+  
+  genes <- colnames(spf_expr)
+  n_genes <- length(genes)
+  cat("Number of genes for correlation analysis after filtering:", n_genes, "\n")
+  
+  all_possible_pairs <- t(combn(n_genes, 2))
+  n_pairs_to_sample <- min(n_pairs, nrow(all_possible_pairs))
+  cat("Sampling", n_pairs_to_sample, "gene pairs randomly from all possible pairs\n\n")
+  
+  sampled_pairs <- all_possible_pairs[sample(nrow(all_possible_pairs), n_pairs_to_sample), , drop = FALSE]
+  
+  results_df <- data.frame(
+    gene1 = genes[sampled_pairs[,1]],
+    gene2 = genes[sampled_pairs[,2]],
+    cor_spf = numeric(n_pairs_to_sample),
+    cor_mm12 = numeric(n_pairs_to_sample),
+    cor_gf = numeric(n_pairs_to_sample),
+    diff_mm12 = numeric(n_pairs_to_sample),
+    diff_gf = numeric(n_pairs_to_sample),
+    stringsAsFactors = FALSE
+  )
+  
+  cat("Calculating correlations for sampled gene pairs...\n")
+  pb <- txtProgressBar(min = 0, max = n_pairs_to_sample, style = 3)
+  for(i in seq_len(n_pairs_to_sample)) {
+    g1 <- sampled_pairs[i,1]
+    g2 <- sampled_pairs[i,2]
+    results_df$cor_spf[i] <- cor(spf_expr[, g1], spf_expr[, g2])
+    results_df$cor_mm12[i] <- cor(mm12_expr[, g1], mm12_expr[, g2])
+    results_df$cor_gf[i] <- cor(gf_expr[, g1], gf_expr[, g2])
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  results_df$diff_mm12 <- results_df$cor_spf - results_df$cor_mm12
+  results_df$diff_gf <- results_df$cor_spf - results_df$cor_gf
+  
+  cat("Selecting top", top_n, "gene pairs with greatest decrease in correlation for MM12 vs SPF\n")
+  top5_mm12 <- results_df %>% arrange(desc(diff_mm12)) %>% head(top_n)
+  print(top5_mm12)
+  
+  cat("\nSelecting top", top_n, "gene pairs with greatest decrease in correlation for GF vs SPF\n")
+  top5_gf <- results_df %>% arrange(desc(diff_gf)) %>% head(top_n)
+  print(top5_gf)
+  
+  list(
+    top5_mm12 = top5_mm12,
+    top5_gf = top5_gf
+  )
+}
+
+cat("Processing Ileum\n")
+ileum_results_pairs <- get_top_diff_pairs_prefiltered(ileum_normed_dat_corrected, results, "Ileum")
+
+cat("\nProcessing Liver\n")
+liver_results_pairs <- get_top_diff_pairs_prefiltered(liver_normed_dat, results, "Liver")
+
+
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(grid)
+
+# Color palette
+spectral <- brewer.pal(11, 'Spectral')
+color_map <- c(
+  'Liver_GF' = spectral[3],
+  'Liver_SPF' = spectral[1],
+  'Liver_MM12' = spectral[2],
+  'Ileum_GF' = spectral[9],
+  'Ileum_SPF' = spectral[11],
+  'Ileum_MM12' = spectral[10]
+)
+
+# Custom theme
+common_theme <- theme(
+  axis.text.x = element_text(size = 20, angle = 45, hjust = 1),
+  axis.text.y = element_text(size = 20),
+  axis.title = element_text(size = 20),
+  plot.title = element_text(size = 30, face = "bold"),
+  plot.subtitle = element_text(size = 30),
+  panel.background = element_rect(fill = "white"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, size = 1),
+  axis.line = element_line(color = "black", size = 1),
+  text = element_text(size = 20),
+  legend.text = element_text(size = 30),
+  legend.title = element_text(size = 30),
+  legend.key.size = unit(0.6, "cm"),
+  strip.text = element_text(size = 16),
+  legend.position = "bottom"
+)
+
+# Gene mapping
+all_ensembl_ids <- unique(c(rownames(ileum_normed_dat_corrected), rownames(liver_normed_dat)))
+gene_map_raw <- AnnotationDbi::select(
+  x = org.Mm.eg.db,
+  keys = all_ensembl_ids,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+gene_map_raw <- gene_map_raw[!is.na(gene_map_raw$SYMBOL), ]
+gene_map <- gene_map_raw[!duplicated(gene_map_raw$ENSEMBL), ]
+symbol_to_ensembl <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+
+# Main function
+make_pair_scatter_with_table <- function(normed_data, tissue_prefix, gene_pairs_df, color_map, top_n = 5) {
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  mm12_samples <- grep(paste0("^", tissue_prefix, "(", paste(61:75, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  gf_samples <- grep(paste0("^", tissue_prefix, "(", paste(76:90, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+
+  top_df <- gene_pairs_df[seq_len(min(top_n, nrow(gene_pairs_df))), , drop = FALSE]
+
+  all_rows <- list()
+  for (i in seq_len(nrow(top_df))) {
+    gene1 <- as.character(top_df$gene1[i])
+    gene2 <- as.character(top_df$gene2[i])
+    g1 <- symbol_to_ensembl[gene1]
+    g2 <- symbol_to_ensembl[gene2]
+    if (is.na(g1) || is.na(g2)) next
+    pair_name <- paste0(gene1, " vs ", gene2)
+
+    make_df <- function(samples, group) {
+      data.frame(
+        sample = samples,
+        group = group,
+        gene1 = as.numeric(normed_data[g1, samples]),
+        gene2 = as.numeric(normed_data[g2, samples]),
+        pair = pair_name,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    all_rows[[length(all_rows) + 1]] <- rbind(
+      make_df(spf_samples, paste0(tissue_prefix, "_SPF")),
+      make_df(mm12_samples, paste0(tissue_prefix, "_MM12")),
+      make_df(gf_samples, paste0(tissue_prefix, "_GF"))
+    )
+  }
+
+  combined_df <- do.call(rbind, all_rows)
+
+  p <- ggplot(combined_df, aes(x = gene1, y = gene2, color = group)) +
+    geom_point(size = 2) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+    facet_wrap(~pair, scales = "free") +
+    scale_color_manual(values = color_map, labels = gsub("_", " ", names(color_map))) +
+    labs(
+      title = paste(tissue_prefix, "- Gene Pair Correlations"),
+      x = "Gene 1 Expression",
+      y = "Gene 2 Expression",
+      color = "Group"
+    ) +
+    common_theme
+
+  groups <- unique(combined_df$group)
+  pairs <- unique(combined_df$pair)
+  r2_mat <- matrix(NA, nrow = length(groups), ncol = length(pairs),
+                   dimnames = list(gsub("_", " ", groups), pairs))
+
+  for (i in seq_along(groups)) {
+    for (j in seq_along(pairs)) {
+      subset_df <- combined_df[combined_df$group == groups[i] & combined_df$pair == pairs[j], ]
+      if (nrow(subset_df) > 1 && all(!is.na(subset_df$gene1)) && all(!is.na(subset_df$gene2))) {
+        r2 <- summary(lm(gene2 ~ gene1, data = subset_df))$r.squared
+        r2_mat[i, j] <- round(r2, 3)
+      }
+    }
+  }
+
+  r2_df <- as.data.frame(r2_mat)
+  r2_df$Group <- rownames(r2_df)
+  r2_df <- r2_df[, c("Group", colnames(r2_df)[1:(ncol(r2_df) - 1)])]
+  r2_table <- ggtexttable(r2_df, rows = NULL, theme = ttheme("mOrange"))
+  r2_table_annotated <- annotate_figure(r2_table, top = text_grob("R² values", face = "bold", size = 20))
+
+  p / r2_table_annotated + plot_layout(heights = c(3, 1))
+}
+
+# Generate plots
+plot_ileum <- make_pair_scatter_with_table(
+  normed_data = ileum_normed_dat_corrected,
+  tissue_prefix = "Ileum",
+  gene_pairs_df = ileum_results_pairs$top5_gf,
+  color_map = color_map,
+  top_n = 5
+)
+
+plot_liver <- make_pair_scatter_with_table(
+  normed_data = liver_normed_dat,
+  tissue_prefix = "Liver",
+  gene_pairs_df = liver_results_pairs$top5_gf,
+  color_map = color_map,
+  top_n = 5
+)
+
+# Print
+print(plot_ileum)
+print(plot_liver)
+
+
+
+
+```
+
+```{r module_validation}
+library(dplyr)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(grid)
+
+# Color palette
+spectral <- brewer.pal(11, 'Spectral')
+color_map <- c(
+  'Liver_GF' = spectral[3],
+  'Liver_SPF' = spectral[1],
+  'Liver_MM12' = spectral[2],
+  'Ileum_GF' = spectral[9],
+  'Ileum_SPF' = spectral[11],
+  'Ileum_MM12' = spectral[10]
+)
+
+# Custom theme
+common_theme <- theme(
+  axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+  axis.text.y = element_text(size = 16),
+  axis.title = element_text(size = 18),
+  plot.title = element_text(size = 24, face = "bold"),
+  plot.subtitle = element_text(size = 20),
+  panel.background = element_rect(fill = "white"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, size = 1),
+  axis.line = element_line(color = "black", size = 1),
+  text = element_text(size = 16),
+  legend.text = element_text(size = 20),
+  legend.title = element_text(size = 20),
+  legend.key.size = unit(0.6, "cm"),
+  strip.text = element_text(size = 12),
+  legend.position = "bottom"
+)
+
+# Gene mapping
+all_ensembl_ids <- unique(c(rownames(ileum_normed_dat_corrected), rownames(liver_normed_dat)))
+gene_map_raw <- AnnotationDbi::select(
+  x = org.Mm.eg.db,
+  keys = all_ensembl_ids,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+gene_map_raw <- gene_map_raw[!is.na(gene_map_raw$SYMBOL), ]
+gene_map <- gene_map_raw[!duplicated(gene_map_raw$ENSEMBL), ]
+symbol_to_ensembl <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+ensembl_to_symbol <- setNames(gene_map$SYMBOL, gene_map$ENSEMBL)
+
+# Function to create module validation plots
+make_module_validation_scatter <- function(normed_data, tissue_prefix, gene_pairs_df, color_map) {
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  mm12_samples <- grep(paste0("^", tissue_prefix, "(", paste(61:75, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  gf_samples <- grep(paste0("^", tissue_prefix, "(", paste(76:90, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+
+  all_rows <- list()
+  
+  for(i in seq_len(nrow(gene_pairs_df))) {
+    gene1_symbol <- gene_pairs_df$gene1[i]
+    gene2_symbol <- gene_pairs_df$gene2[i]
+    pathway <- gene_pairs_df$pathway[i]
+    module_color <- gene_pairs_df$module[i]
+    
+    # Convert to Ensembl IDs
+    g1 <- symbol_to_ensembl[gene1_symbol]
+    g2 <- symbol_to_ensembl[gene2_symbol]
+    
+    if(is.na(g1) || is.na(g2)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not found\n")
+      next
+    }
+    
+    if(!g1 %in% rownames(normed_data) || !g2 %in% rownames(normed_data)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not in data\n")
+      next
+    }
+    
+    pair_name <- paste0(gene1_symbol, " vs ", gene2_symbol, "\n(", pathway, " - ", module_color, " module)")
+    
+    make_df <- function(samples, group) {
+      data.frame(
+        sample = samples,
+        group = group,
+        gene1 = as.numeric(normed_data[g1, samples]),
+        gene2 = as.numeric(normed_data[g2, samples]),
+        pair = pair_name,
+        pathway = pathway,
+        module = module_color,
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    all_rows[[length(all_rows) + 1]] <- rbind(
+      make_df(spf_samples, paste0(tissue_prefix, "_SPF")),
+      make_df(mm12_samples, paste0(tissue_prefix, "_MM12")),
+      make_df(gf_samples, paste0(tissue_prefix, "_GF"))
+    )
+  }
+  
+  if(length(all_rows) == 0) {
+    cat("No valid gene pairs found for", tissue_prefix, "\n")
+    return(NULL)
+  }
+  
+  combined_df <- do.call(rbind, all_rows)
+  
+  # Calculate and print correlations to console
+  cat("\n=== Correlation Analysis for", tissue_prefix, "===\n")
+  groups <- unique(combined_df$group)
+  pairs <- unique(combined_df$pair)
+  
+  for (pair in pairs) {
+    cat("\n--- Gene Pair:", pair, "---\n")
+    for (group in groups) {
+      subset_df <- combined_df[combined_df$group == group & combined_df$pair == pair, ]
+      if (nrow(subset_df) > 1 && all(!is.na(subset_df$gene1)) && all(!is.na(subset_df$gene2))) {
+        correlation <- cor(subset_df$gene1, subset_df$gene2)
+        r2 <- summary(lm(gene2 ~ gene1, data = subset_df))$r.squared
+        cat(sprintf("%s: r = %.3f, R² = %.3f\n", gsub("_", " ", group), correlation, r2))
+      }
+    }
+  }
+  cat("\n")
+  
+  p <- ggplot(combined_df, aes(x = gene1, y = gene2, color = group)) +
+    geom_point(size = 3) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+    facet_wrap(~pair, scales = "free") +
+    scale_color_manual(values = color_map, labels = gsub("_", " ", names(color_map))) +
+    labs(
+      title = paste(tissue_prefix, "- Module Validation"),
+      x = "Gene 1 Expression",
+      y = "Gene 2 Expression",
+      color = "Group"
+    ) +
+    common_theme
+  
+  return(p)
+}
+
+# Function to extract genes from specific module
+extract_module_genes <- function(module_data, module_name = "black") {
+  # Assuming module_data has gene assignments
+  # This function needs to be adapted based on your module data structure
+  module_genes <- module_data[module_data$module == module_name, "gene"]
+  return(module_genes)
+}
+
+# Define specific gene pairs for validation (6 pairs each tissue)
+ileum_gene_pairs <- data.frame(
+  gene1 = c("Cd79a", "Slc10a2", "Ifit1", "Rps6", "Il1b", "Pax5", "Il7r"),
+  gene2 = c("Cd79b", "Fabp6", "Mx1", "Rpl13", "Tnf", "Ms4a1", "Il7"),
+  pathway = c("B cell activation", "Steroid metabolism", "Viral response", 
+              "Ribosome genes", "Immune response", "B cell activation", "T cell"),
+  module = c("black", "magenta", "darkmagenta", "darkgreen", "yellow", "black", "tan"),
+  stringsAsFactors = FALSE
+)
+
+liver_gene_pairs <- data.frame(
+  gene1 = c("Cyp7a1", "Acox1", "Rps6", "Cyp1a2", "Bub1", "Lpl"),
+  gene2 = c("Cyp8b1", "Cpt1a", "Rpl13", "Cyp2e1", "Mad2l1", "Lipc"),
+  pathway = c("Bile acid synthesis", "Fatty acid metabolism", "Translation machinery",
+              "Small molecule catabolism", "Chromosome segregation", "Lipid catabolism"),
+  module = c("turquoise", "greenyellow", "yellow", "turquoise", "black", "purple"),
+  stringsAsFactors = FALSE
+)
+
+# Alternative: If you have module assignments, extract genes from black module
+# black_module_genes <- extract_module_genes(your_module_data, "black")
+# ileum_gene_sets[["black_module"]] <- black_module_genes
+
+# Generate validation plots
+cat("Generating Ileum module validation plots...\n")
+plot_ileum_validation <- make_module_validation_scatter(
+  normed_data = ileum_normed_dat_corrected,
+  tissue_prefix = "Ileum",
+  gene_pairs_df = ileum_gene_pairs,
+  color_map = color_map
+)
+
+cat("Generating Liver module validation plots...\n")
+plot_liver_validation <- make_module_validation_scatter(
+  normed_data = liver_normed_dat,
+  tissue_prefix = "Liver",
+  gene_pairs_df = liver_gene_pairs,
+  color_map = color_map
+)
+
+# Print plots
+if(!is.null(plot_ileum_validation)) {
+  print(plot_ileum_validation)
+}
+
+if(!is.null(plot_liver_validation)) {
+  print(plot_liver_validation)
+}
+```
+
+```{r module_validation_updated}
+library(dplyr)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(grid)
+
+# Color palette
+spectral <- brewer.pal(11, 'Spectral')
+color_map <- c(
+  'Liver_GF' = spectral[3],
+  'Liver_SPF' = spectral[1],
+  'Liver_MM12' = spectral[2],
+  'Ileum_GF' = spectral[9],
+  'Ileum_SPF' = spectral[11],
+  'Ileum_MM12' = spectral[10]
+)
+
+# Custom theme
+common_theme <- theme(
+  axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+  axis.text.y = element_text(size = 16),
+  axis.title = element_text(size = 18),
+  plot.title = element_text(size = 24, face = "bold"),
+  plot.subtitle = element_text(size = 20),
+  panel.background = element_rect(fill = "white"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, size = 1),
+  axis.line = element_line(color = "black", size = 1),
+  text = element_text(size = 16),
+  legend.text = element_text(size = 20),
+  legend.title = element_text(size = 20),
+  legend.key.size = unit(0.6, "cm"),
+  strip.text = element_text(size = 12),
+  legend.position = "bottom"
+)
+
+# Gene mapping
+all_ensembl_ids <- unique(c(rownames(ileum_normed_dat_corrected), rownames(liver_normed_dat)))
+gene_map_raw <- AnnotationDbi::select(
+  x = org.Mm.eg.db,
+  keys = all_ensembl_ids,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+gene_map_raw <- gene_map_raw[!is.na(gene_map_raw$SYMBOL), ]
+gene_map <- gene_map_raw[!duplicated(gene_map_raw$ENSEMBL), ]
+symbol_to_ensembl <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+ensembl_to_symbol <- setNames(gene_map$SYMBOL, gene_map$ENSEMBL)
+
+# Function to create module validation plots
+make_module_validation_scatter <- function(normed_data, tissue_prefix, gene_pairs_df, color_map) {
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  mm12_samples <- grep(paste0("^", tissue_prefix, "(", paste(61:75, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  gf_samples <- grep(paste0("^", tissue_prefix, "(", paste(76:90, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+
+  all_rows <- list()
+  
+  for(i in seq_len(nrow(gene_pairs_df))) {
+    gene1_symbol <- gene_pairs_df$gene1[i]
+    gene2_symbol <- gene_pairs_df$gene2[i]
+    pathway <- gene_pairs_df$pathway[i]
+    module_color <- gene_pairs_df$module[i]
+    
+    # Convert to Ensembl IDs
+    g1 <- symbol_to_ensembl[gene1_symbol]
+    g2 <- symbol_to_ensembl[gene2_symbol]
+    
+    if(is.na(g1) || is.na(g2)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not found\n")
+      next
+    }
+    
+    if(!g1 %in% rownames(normed_data) || !g2 %in% rownames(normed_data)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not in data\n")
+      next
+    }
+    
+    pair_name <- paste0(gene1_symbol, " vs ", gene2_symbol, "\n(", pathway, " - ", module_color, " module)")
+    
+    make_df <- function(samples, group) {
+      data.frame(
+        sample = samples,
+        group = group,
+        gene1 = as.numeric(normed_data[g1, samples]),
+        gene2 = as.numeric(normed_data[g2, samples]),
+        pair = pair_name,
+        pathway = pathway,
+        module = module_color,
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    all_rows[[length(all_rows) + 1]] <- rbind(
+      make_df(spf_samples, paste0(tissue_prefix, "_SPF")),
+      make_df(mm12_samples, paste0(tissue_prefix, "_MM12")),
+      make_df(gf_samples, paste0(tissue_prefix, "_GF"))
+    )
+  }
+  
+  if(length(all_rows) == 0) {
+    cat("No valid gene pairs found for", tissue_prefix, "\n")
+    return(NULL)
+  }
+  
+  combined_df <- do.call(rbind, all_rows)
+  
+  # Calculate and print correlations to console
+  cat("\n=== Correlation Analysis for", tissue_prefix, "===\n")
+  groups <- unique(combined_df$group)
+  pairs <- unique(combined_df$pair)
+  
+  for (pair in pairs) {
+    cat("\n--- Gene Pair:", pair, "---\n")
+    for (group in groups) {
+      subset_df <- combined_df[combined_df$group == group & combined_df$pair == pair, ]
+      if (nrow(subset_df) > 1 && all(!is.na(subset_df$gene1)) && all(!is.na(subset_df$gene2))) {
+        correlation <- cor(subset_df$gene1, subset_df$gene2)
+        r2 <- summary(lm(gene2 ~ gene1, data = subset_df))$r.squared
+        cat(sprintf("%s: r = %.3f, R² = %.3f\n", gsub("_", " ", group), correlation, r2))
+      }
+    }
+  }
+  cat("\n")
+  
+  p <- ggplot(combined_df, aes(x = gene1, y = gene2, color = group)) +
+    geom_point(size = 3) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+    facet_wrap(~pair, scales = "free") +
+    scale_color_manual(values = color_map, labels = gsub("_", " ", names(color_map))) +
+    labs(
+      title = paste(tissue_prefix, "- Module Validation"),
+      x = "Gene 1 Expression",
+      y = "Gene 2 Expression",
+      color = "Group"
+    ) +
+    common_theme
+  
+  return(p)
+}
+
+# Updated prioritized gene pairs based on actual GO terms from module analysis
+ileum_priority_pairs <- data.frame(
+  gene1 = c("Cd79a", "Rps6", "Ifit1", "Atg5", "Ccnd1", "Foxp3"),
+  gene2 = c("Cd79b", "Rpl13", "Mx1", "Atg7", "Cdk2", "Il2ra"),
+  pathway = c("B cell activation", "Ribonucleoprotein complex biogenesis", "Disruption of cellular anatomical structure", 
+              "Macroautophagy", "Regulation of G1/S transition", "Positive regulation of cell activation"),
+  module = c("tan", "royalblue", "black", "brown", "darkorange", "greenyellow"),
+  stringsAsFactors = FALSE
+)
+
+liver_priority_pairs <- data.frame(
+  gene1 = c("Cyp7a1", "Acox1", "Atp5a1", "Cyp1a2", "Rps6", "Hist1h1a"),
+  gene2 = c("Cyp8b1", "Cpt1a", "Atp5b", "Cyp2e1", "Rpl13", "Hist1h2ab"),
+  pathway = c("Steroid metabolic process", "Small molecule catabolic process", "Generation of precursor metabolites and energy",
+              "Oxidative demethylation", "Ribonucleoprotein complex biogenesis", "Chromatin remodeling"),
+  module = c("midnightblue", "brown", "blue", "cyan", "greenyellow", "turquoise"),
+  stringsAsFactors = FALSE
+)
+# Generate validation plots
+cat("Generating Ileum module validation plots...\n")
+plot_ileum_validation <- make_module_validation_scatter(
+  normed_data = ileum_normed_dat_corrected,
+  tissue_prefix = "Ileum",
+  gene_pairs_df = ileum_gene_pairs,
+  color_map = color_map
+)
+
+cat("Generating Liver module validation plots...\n")
+plot_liver_validation <- make_module_validation_scatter(
+  normed_data = liver_normed_dat,
+  tissue_prefix = "Liver",
+  gene_pairs_df = liver_gene_pairs,
+  color_map = color_map
+)
+
+# Print plots
+if(!is.null(plot_ileum_validation)) {
+  print(plot_ileum_validation)
+}
+
+if(!is.null(plot_liver_validation)) {
+  print(plot_liver_validation)
+}
+```
+
+```{r spf_only_validation_updated}
+library(dplyr)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(grid)
+
+# Color palette
+spectral <- brewer.pal(11, 'Spectral')
+color_map <- c(
+  'Liver_GF' = spectral[3],
+  'Liver_SPF' = spectral[1],
+  'Liver_MM12' = spectral[2],
+  'Ileum_GF' = spectral[9],
+  'Ileum_SPF' = spectral[11],
+  'Ileum_MM12' = spectral[10]
+)
+
+# Custom theme
+common_theme <- theme(
+  axis.text.x = element_text(size = 16),
+  axis.text.y = element_text(size = 16),
+  axis.title = element_text(size = 18),
+  plot.title = element_text(size = 24, face = "bold"),
+  plot.subtitle = element_text(size = 20),
+  panel.background = element_rect(fill = "white"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, size = 1),
+  axis.line = element_line(color = "black", size = 1),
+  text = element_text(size = 16),
+  strip.text = element_text(size = 12)
+)
+
+# Gene mapping
+all_ensembl_ids <- unique(c(rownames(ileum_normed_dat_corrected), rownames(liver_normed_dat)))
+gene_map_raw <- AnnotationDbi::select(
+  x = org.Mm.eg.db,
+  keys = all_ensembl_ids,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+gene_map_raw <- gene_map_raw[!is.na(gene_map_raw$SYMBOL), ]
+gene_map <- gene_map_raw[!duplicated(gene_map_raw$ENSEMBL), ]
+symbol_to_ensembl <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+ensembl_to_symbol <- setNames(gene_map$SYMBOL, gene_map$ENSEMBL)
+
+# Updated prioritized gene pairs based on actual GO terms from module analysis
+ileum_priority_pairs <- data.frame(
+  gene1 = c("Cd79a", "Rps6", "Ifit1", "Atg5", "Ccnd1", "Foxp3"),
+  gene2 = c("Cd79b", "Rpl13", "Mx1", "Atg7", "Cdk2", "Il2ra"),
+  pathway = c("B cell activation", "Ribonucleoprotein complex biogenesis", "Disruption of cellular anatomical structure", 
+              "Macroautophagy", "Regulation of G1/S transition", "Positive regulation of cell activation"),
+  module = c("tan", "royalblue", "black", "brown", "darkorange", "greenyellow"),
+  stringsAsFactors = FALSE
+)
+
+liver_priority_pairs <- data.frame(
+  gene1 = c("Cyp7a1", "Acox1", "Atp5a1", "Cyp1a2", "Rps6", "Hist1h1a"),
+  gene2 = c("Cyp8b1", "Cpt1a", "Atp5b", "Cyp2e1", "Rpl13", "Hist1h2ab"),
+  pathway = c("Steroid metabolic process", "Small molecule catabolic process", "Generation of precursor metabolites and energy",
+              "Oxidative demethylation", "Ribonucleoprotein complex biogenesis", "Chromatin remodeling"),
+  module = c("midnightblue", "brown", "blue", "cyan", "greenyellow", "turquoise"),
+  stringsAsFactors = FALSE
+)
+
+# Updated comprehensive gene lists for each pathway based on actual GO terms
+ileum_pathway_genes <- list(
+  "B cell activation" = c("Cd79a", "Cd79b", "Cd19", "Ms4a1", "Pax5", "Ebf1", "Ighm", "Ighd", "Igha", "Ighg1", "Ighg2a", "Ighg2b", "Ighg3",
+                          "Blnk", "Syk", "Btk", "Lyn", "Fyn", "Cr2", "Cd22", "Fcmr", "Cd72", "Siglecg", "Fcgr2b", "Cd40", "Cd86", "Cd80", "Cd28",
+                          "Bcl6", "Irf4", "Irf8", "Spib", "Foxo1", "Bach2", "Prdm1", "Xbp1", "Aicda", "Ung", "Msh2", "Msh6", "Pms2", "Mlh1"),
+  "Ribonucleoprotein complex biogenesis" = c("Rps6", "Rpl13", "Rps3", "Rps4x", "Rps5", "Rps7", "Rps8", "Rps9", "Rps10", "Rps11", "Rps12", "Rps13", "Rps14", "Rps15",
+                                             "Rps16", "Rps17", "Rps18", "Rps19", "Rps20", "Rps21", "Rps23", "Rps24", "Rps25", "Rps26", "Rps27", "Rps28", "Rps29",
+                                             "Rpl3", "Rpl4", "Rpl5", "Rpl6", "Rpl7", "Rpl7a", "Rpl8", "Rpl9", "Rpl10", "Rpl10a", "Rpl11", "Rpl12", "Rpl13a", "Rpl14",
+                                             "Rpl15", "Rpl17", "Rpl18", "Rpl18a", "Rpl19", "Rpl21", "Rpl22", "Rpl23", "Rpl23a", "Rpl24", "Rpl26", "Rpl27", "Rpl27a",
+                                             "Npm1", "Nucleolin", "Ddx5", "Ddx17", "Rrp9", "Nop2", "Fibrillarin", "Nop56", "Nop58", "Snu13", "Nhp2"),
+  "Disruption of cellular anatomical structure" = c("Ifit1", "Ifit2", "Ifit3", "Mx1", "Mx2", "Ifi44", "Ifi47", "Ifi35", "Ifi27", "Ifi204", "Ifi202b",
+                                                     "Isg15", "Isg20", "Oas1a", "Oas1b", "Oas2", "Oas3", "Rsad2", "Irf1", "Irf3", "Irf7", "Stat1", "Stat2",
+                                                     "Ifitm1", "Ifitm2", "Ifitm3", "Usp18", "Trim25", "Trim21", "Ddx58", "Ifih1", "Dhx58", "Tlr3", "Tlr7", "Tlr9"),
+  "Macroautophagy" = c("Atg5", "Atg7", "Atg3", "Atg4a", "Atg4b", "Atg4c", "Atg4d", "Atg8", "Atg9a", "Atg9b", "Atg10", "Atg12", "Atg13", "Atg14", "Atg16l1",
+                       "Becn1", "Pik3c3", "Pik3r4", "Ulk1", "Ulk2", "Rb1cc1", "Atg101", "Wipi1", "Wipi2", "Map1lc3a", "Map1lc3b", "Gabarap", "Gabarapl1", "Gabarapl2",
+                       "Sqstm1", "Calcoco2", "Optn", "Nbr1", "Toll", "Pink1", "Park2", "Bnip3", "Bnip3l", "Fundc1", "Bcl2l13"),
+  "Regulation of G1/S transition" = c("Ccnd1", "Ccnd2", "Ccnd3", "Cdk2", "Cdk4", "Cdk6", "Cdkn1a", "Cdkn1b", "Cdkn2a", "Cdkn2b", "Cdkn2c", "Cdkn2d",
+                                      "Rb1", "E2f1", "E2f2", "E2f3", "Dp1", "Dp2", "Myc", "Mycn", "Max", "Mad1l1", "Mxi1", "Skp2", "Cks1b", "Fbxw7"),
+  "Positive regulation of cell activation" = c("Foxp3", "Il2ra", "Cd28", "Cd80", "Cd86", "Icos", "Icoslg", "Pd1", "Pdl1", "Pdl2", "Ctla4", "Il2", "Il4", "Il10",
+                                               "Tgfb1", "Stat5a", "Stat5b", "Foxo1", "Foxo3", "Nfatc1", "Nfatc2", "Nfkb1", "Rel", "Bcl2", "Bcl2l1")
+)
+
+liver_pathway_genes <- list(
+  "Steroid metabolic process" = c("Cyp7a1", "Cyp8b1", "Cyp27a1", "Cyp7b1", "Cyp39a1", "Cyp46a1", "Hsd3b7", "Akr1d1", "Akr1c14", "Amacr", "Baat", "Bal",
+                                  "Nr1h4", "Nr0b2", "Nr1i2", "Nr1i3", "Hnf4a", "Srebf1", "Srebf2", "Hmgcr", "Hmgcs1", "Hmgcs2", "Mvk", "Pmvk", "Sqle", "Lss",
+                                  "Cyp51", "Sc4mol", "Nsdhl", "Hsd17b7", "Ebp", "Sc5d", "Dhcr7", "Dhcr24", "Star", "Cyp11a1", "Cyp17a1", "Hsd3b1", "Cyp21a1"),
+  "Small molecule catabolic process" = c("Acox1", "Acox2", "Acox3", "Cpt1a", "Cpt1b", "Cpt2", "Acadm", "Acadl", "Acads", "Acadvl", "Acadv", "Hadha", "Hadhb",
+                                         "Hadh", "Ehhadh", "Acaa1", "Acaa2", "Ech1", "Echs1", "Decr1", "Decr2", "Eci1", "Eci2", "Pecr", "Phyh", "Slc25a20",
+                                         "Ppara", "Ppard", "Rxra", "Crot", "Acot1", "Acot2", "Acot7", "Acot8", "Acot9", "Aldh1a1", "Aldh2", "Aldh3a2", "Adh1", "Adh4"),
+  "Generation of precursor metabolites and energy" = c("Atp5a1", "Atp5b", "Atp5c1", "Atp5d", "Atp5e", "Atp5f1", "Atp5g1", "Atp5g2", "Atp5g3", "Atp5h", "Atp5j", "Atp5k",
+                                                       "Ndufa1", "Ndufa2", "Ndufa3", "Ndufa4", "Ndufa5", "Ndufa6", "Ndufa7", "Ndufa8", "Ndufa9", "Ndufa10", "Ndufa11", "Ndufa12",
+                                                       "Cox4i1", "Cox5a", "Cox5b", "Cox6a1", "Cox6b1", "Cox6c", "Cox7a1", "Cox7b", "Cox8a", "Cycs", "Uqcrc1", "Uqcrc2",
+                                                       "Sdhb", "Sdhc", "Sdhd", "Sdha", "Pck1", "G6pc", "Fbp1", "Pc", "Gck", "Pgm1", "Gapdh", "Pgk1", "Eno1", "Pkm"),
+  "Oxidative demethylation" = c("Cyp1a1", "Cyp1a2", "Cyp1b1", "Cyp2a4", "Cyp2a5", "Cyp2b9", "Cyp2b10", "Cyp2c29", "Cyp2c37", "Cyp2c38", "Cyp2c39",
+                                "Cyp2d9", "Cyp2d10", "Cyp2d11", "Cyp2d22", "Cyp2e1", "Cyp2f2", "Cyp3a11", "Cyp3a13", "Cyp3a16", "Cyp3a25", "Cyp4a10", "Cyp4a12a",
+                                "Fmo1", "Fmo2", "Fmo3", "Fmo4", "Fmo5", "Mao1", "Maoa", "Maob", "Aldh1a1", "Aldh1a7", "Aldh2", "Aldh3a1", "Adh1", "Adh4", "Adh5"),
+  "Ribonucleoprotein complex biogenesis" = c("Rps6", "Rpl13", "Rps3", "Rps4x", "Rps5", "Rps7", "Rps8", "Rps9", "Rps10", "Rps11", "Rps12", "Rps13", "Rps14", "Rps15",
+                                             "Rps16", "Rps17", "Rps18", "Rps19", "Rps20", "Rps21", "Rps23", "Rps24", "Rps25", "Rps26", "Rps27", "Rps28", "Rps29",
+                                             "Rpl3", "Rpl4", "Rpl5", "Rpl6", "Rpl7", "Rpl7a", "Rpl8", "Rpl9", "Rpl10", "Rpl10a", "Rpl11", "Rpl12", "Rpl13a", "Rpl14",
+                                             "Npm1", "Ncl", "Ddx5", "Ddx17", "Rrp9", "Nop2", "Fbl", "Nop56", "Nop58", "Snu13", "Nhp2", "Gar1", "Dyskc1"),
+  "Chromatin remodeling" = c("Hist1h1a", "Hist1h1b", "Hist1h1c", "Hist1h1d", "Hist1h1e", "Hist1h2ab", "Hist1h2ac", "Hist1h2ad", "Hist1h2ae", "Hist1h2af",
+                             "Hist1h2ag", "Hist1h2ah", "Hist1h2ai", "Hist1h2aj", "Hist1h2ak", "Hist1h3a", "Hist1h3b", "Hist1h3c", "Hist1h3d", "Hist1h3e",
+                             "Hist1h3f", "Hist1h3g", "Hist1h3h", "Hist1h3i", "Hist1h4a", "Hist1h4b", "Hist1h4c", "Hist1h4d", "Hist1h4f", "Hist1h4h", "Hist1h4i",
+                             "Hist1h4j", "Hist1h4k", "Hist1h4m", "Hist2h2aa1", "Hist2h2aa2", "Hist2h2ab", "Hist2h2ac", "Hist2h2be", "Hist2h3b", "Hist2h3c1",
+                             "Hist2h3c2", "Hist2h4", "Hist3h2a", "Hist3h2ba", "Hist3h3", "Hist4h4", "Chd1", "Chd2", "Chd3", "Chd4", "Chd7", "Chd8", "Chd9",
+                             "Smarca1", "Smarca2", "Smarca4", "Smarca5", "Smarcb1", "Smarcc1", "Smarcc2", "Smarcd1", "Smarcd2", "Smarcd3", "Smarce1", "Arid1a", "Arid1b")
+)
+
+# Function to test correlation between two genes
+test_gene_correlation <- function(normed_data, gene1_symbol, gene2_symbol, spf_samples) {
+  g1 <- symbol_to_ensembl[gene1_symbol]
+  g2 <- symbol_to_ensembl[gene2_symbol]
+  
+  if(is.na(g1) || is.na(g2)) return(NULL)
+  if(!g1 %in% rownames(normed_data) || !g2 %in% rownames(normed_data)) return(NULL)
+  
+  gene1_expr <- as.numeric(normed_data[g1, spf_samples])
+  gene2_expr <- as.numeric(normed_data[g2, spf_samples])
+  
+  if(any(is.na(gene1_expr)) || any(is.na(gene2_expr))) return(NULL)
+  
+  # Check for zero variance (constant expression)
+  if(sd(gene1_expr) == 0 || sd(gene2_expr) == 0) return(NULL)
+  
+  # Safely calculate correlation
+  correlation <- tryCatch({
+    cor(gene1_expr, gene2_expr)
+  }, error = function(e) {
+    return(NA)
+  })
+  
+  if(is.na(correlation)) return(NULL)
+  
+  # Safely calculate R²
+  r2 <- tryCatch({
+    summary(lm(gene2_expr ~ gene1_expr))$r.squared
+  }, error = function(e) {
+    return(NA)
+  })
+  
+  if(is.na(r2)) return(NULL)
+  
+  return(list(
+    gene1 = gene1_symbol,
+    gene2 = gene2_symbol,
+    correlation = correlation,
+    r2 = r2,
+    gene1_expr = gene1_expr,
+    gene2_expr = gene2_expr
+  ))
+}
+
+# Function to find best correlated pair within a pathway (positive correlations only, excludes perfect correlations)
+find_best_pair_in_pathway <- function(normed_data, pathway_genes, spf_samples, min_correlation = 0.45) {
+  best_correlation <- 0  # Start at 0
+  best_pair <- NULL
+  
+  # Test all pairwise combinations within the pathway
+  for(i in 1:(length(pathway_genes)-1)) {
+    for(j in (i+1):length(pathway_genes)) {
+      result <- test_gene_correlation(normed_data, pathway_genes[i], pathway_genes[j], spf_samples)
+      if(!is.null(result) && !is.na(result$correlation) && 
+         result$correlation >= min_correlation &&  # POSITIVE correlations only
+         result$correlation < 1.0 &&  # EXCLUDE perfect correlations
+         result$correlation > best_correlation) {  # Find best positive correlation
+        best_correlation <- result$correlation
+        best_pair <- result
+      }
+    }
+  }
+  
+  return(best_pair)
+}
+
+# Function to create SPF-only module validation plots with priority and backup searching
+make_spf_validation_scatter <- function(normed_data, tissue_prefix, priority_pairs, pathway_genes, min_correlation = 0.45) {
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+  
+  final_pairs <- list()
+  
+  cat("\n=== SPF Validation for", tissue_prefix, "===\n")
+  
+  for(i in seq_len(nrow(priority_pairs))) {
+    pathway <- priority_pairs$pathway[i]
+    module_color <- priority_pairs$module[i]
+    
+    cat("\n--- Pathway:", pathway, "(", module_color, "module) ---\n")
+    
+    # First try the priority pair (check for perfect correlation)
+    priority_result <- test_gene_correlation(
+      normed_data, 
+      priority_pairs$gene1[i], 
+      priority_pairs$gene2[i], 
+      spf_samples
+    )
+    
+    if(!is.null(priority_result)) {
+      cat(sprintf("Priority pair %s vs %s: r = %.3f, R² = %.3f\n", 
+                  priority_result$gene1, priority_result$gene2, 
+                  priority_result$correlation, priority_result$r2))
+      
+      # Only accept positive correlations that meet minimum threshold and are not perfect
+      if(priority_result$correlation >= min_correlation && priority_result$correlation < 1.0) {
+        cat("✓ Priority pair meets positive correlation threshold (non-perfect) - using this pair\n")
+        final_pairs[[pathway]] <- list(
+          result = priority_result,
+          pathway = pathway,
+          module = module_color,
+          source = "priority"
+        )
+        next
+      } else if(priority_result$correlation >= 1.0) {
+        cat("✗ Priority pair has perfect correlation - searching pathway genes for non-perfect positive correlation...\n")
+      } else if(priority_result$correlation < 0) {
+        cat("✗ Priority pair has negative correlation - searching pathway genes for positive correlation...\n")
+      } else {
+        cat("✗ Priority pair below positive correlation threshold - searching pathway genes...\n")
+      }
+    } else {
+      cat("✗ Priority pair not available in data - searching pathway genes...\n")
+    }
+    
+    # Search within pathway genes for better positive correlation (already excludes perfect correlations)
+    if(pathway %in% names(pathway_genes)) {
+      backup_result <- find_best_pair_in_pathway(normed_data, pathway_genes[[pathway]], spf_samples, min_correlation)
+      
+      if(!is.null(backup_result)) {
+        cat(sprintf("Best backup pair %s vs %s: r = %.3f, R² = %.3f\n", 
+                    backup_result$gene1, backup_result$gene2, 
+                    backup_result$correlation, backup_result$r2))
+        final_pairs[[pathway]] <- list(
+          result = backup_result,
+          pathway = pathway,
+          module = module_color,
+          source = "backup"
+        )
+      } else {
+        cat("No suitable backup pairs found in pathway (positive correlations only, excluding perfect correlations)\n")
+      }
+    }
+  }
+  
+  if(length(final_pairs) == 0) {
+    cat("No suitable gene pairs found for", tissue_prefix, "(positive correlations only)\n")
+    return(NULL)
+  }
+  
+  # Create plotting data
+  all_rows <- list()
+  for(pathway in names(final_pairs)) {
+    pair_info <- final_pairs[[pathway]]
+    result <- pair_info$result
+    
+    pair_name <- paste0(result$gene1, " vs ", result$gene2, "\n(", pathway, " - ", pair_info$module, " module)")
+    
+    spf_df <- data.frame(
+      sample = spf_samples,
+      gene1 = result$gene1_expr,
+      gene2 = result$gene2_expr,
+      pair = pair_name,
+      pathway = pathway,
+      module = pair_info$module,
+      correlation = round(result$correlation, 3),
+      r2 = round(result$r2, 3),
+      source = pair_info$source,
+      stringsAsFactors = FALSE
+    )
+    
+    all_rows[[length(all_rows) + 1]] <- spf_df
+  }
+  
+  combined_df <- do.call(rbind, all_rows)
+  
+  # Get the appropriate SPF color
+  spf_color <- color_map[paste0(tissue_prefix, "_SPF")]
+  
+  p <- ggplot(combined_df, aes(x = gene1, y = gene2)) +
+    geom_point(size = 3, color = spf_color, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = spf_color, linewidth = 1) +
+    facet_wrap(~pair, scales = "free") +
+    labs(
+      title = paste(tissue_prefix, "SPF - Module Validation (Best Positive Correlated Pairs)"),
+      x = "Gene 1 Expression",
+      y = "Gene 2 Expression",
+      caption = paste("Showing gene pairs with", min_correlation, "≤ r < 1.0 (positive correlations only, excluding perfect correlations)")
+    ) +
+    common_theme
+  
+  return(p)
+}
+
+# Generate validation plots
+cat("Generating Ileum SPF module validation plots...\n")
+plot_ileum_spf <- make_spf_validation_scatter(
+  normed_data = ileum_normed_dat_corrected,
+  tissue_prefix = "Ileum",
+  priority_pairs = ileum_priority_pairs,
+  pathway_genes = ileum_pathway_genes,
+  min_correlation = 0.45
+)
+
+cat("Generating Liver SPF module validation plots...\n")
+plot_liver_spf <- make_spf_validation_scatter(
+  normed_data = liver_normed_dat,
+  tissue_prefix = "Liver",
+  priority_pairs = liver_priority_pairs,
+  pathway_genes = liver_pathway_genes,
+  min_correlation = 0.45
+)
+
+# Print plots
+if(!is.null(plot_ileum_spf)) {
+  print(plot_ileum_spf)
+}
+
+if(!is.null(plot_liver_spf)) {
+  print(plot_liver_spf)
+}
+```
+
+```{r spf_only_validation}
+library(dplyr)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(grid)
+
+# Color palette
+spectral <- brewer.pal(11, 'Spectral')
+color_map <- c(
+  'Liver_GF' = spectral[3],
+  'Liver_SPF' = spectral[1],
+  'Liver_MM12' = spectral[2],
+  'Ileum_GF' = spectral[9],
+  'Ileum_SPF' = spectral[11],
+  'Ileum_MM12' = spectral[10]
+)
+
+# Custom theme
+common_theme <- theme(
+  axis.text.x = element_text(size = 16),
+  axis.text.y = element_text(size = 16),
+  axis.title = element_text(size = 18),
+  plot.title = element_text(size = 24, face = "bold"),
+  plot.subtitle = element_text(size = 20),
+  panel.background = element_rect(fill = "white"),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_rect(color = "black", fill = NA, size = 1),
+  axis.line = element_line(color = "black", size = 1),
+  text = element_text(size = 16),
+  strip.text = element_text(size = 12)
+)
+
+# Gene mapping
+all_ensembl_ids <- unique(c(rownames(ileum_normed_dat_corrected), rownames(liver_normed_dat)))
+gene_map_raw <- AnnotationDbi::select(
+  x = org.Mm.eg.db,
+  keys = all_ensembl_ids,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)
+gene_map_raw <- gene_map_raw[!is.na(gene_map_raw$SYMBOL), ]
+gene_map <- gene_map_raw[!duplicated(gene_map_raw$ENSEMBL), ]
+symbol_to_ensembl <- setNames(gene_map$ENSEMBL, gene_map$SYMBOL)
+ensembl_to_symbol <- setNames(gene_map$SYMBOL, gene_map$ENSEMBL)
+
+# Define specific gene pairs for validation (6 pairs each tissue)
+ileum_gene_pairs <- data.frame(
+  gene1 = c("Cd79a", "Cxcl13", "Defa20", "Ifit1", "Rps5", "Slc10a2"),
+  gene2 = c("Cd79b", "Cxcr4", "Defa21", "Mx1", "Rpl18a", "Fabp6"),
+  pathway = c("B cell activation", "Inflammatory cytokines", "Intestinal epithelial", 
+              "Interferon response", "Ribosome genes", "Bile acid transport"),
+  module = c("tan", "greenyellow", "black", "pink", "royalblue", "darkturquoise"),
+  stringsAsFactors = FALSE
+)
+
+liver_gene_pairs <- data.frame(
+  gene1 = c("Acadvl", "Apoa1", "Cox5b", "Cyp1a2", "Eno1", "Idi1"),
+  gene2 = c("Acaa2", "Apoa4", "Cox6b1", "Cyp2e1", "Adh1", "Hsd17b7"),
+  pathway = c("Fatty acid metabolism", "Lipid transport", "Oxidative phosphorylation",
+              "Drug metabolism", "Gluconeogenesis", "Bile acid synthesis"),
+  module = c("brown", "purple", "blue", "cyan", "red", "midnightblue"),
+  stringsAsFactors = FALSE
+)
+
+
+
+# Function to create SPF-only module validation plots
+make_spf_validation_scatter <- function(normed_data, tissue_prefix, gene_pairs_df) {
+  spf_samples <- grep(paste0("^", tissue_prefix, "(", paste(1:15, collapse = "|"), ")$"), colnames(normed_data), value = TRUE)
+
+  all_rows <- list()
+  
+  for(i in seq_len(nrow(gene_pairs_df))) {
+    gene1_symbol <- gene_pairs_df$gene1[i]
+    gene2_symbol <- gene_pairs_df$gene2[i]
+    pathway <- gene_pairs_df$pathway[i]
+    module_color <- gene_pairs_df$module[i]
+    
+    # Convert to Ensembl IDs
+    g1 <- symbol_to_ensembl[gene1_symbol]
+    g2 <- symbol_to_ensembl[gene2_symbol]
+    
+    if(is.na(g1) || is.na(g2)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not found\n")
+      next
+    }
+    
+    if(!g1 %in% rownames(normed_data) || !g2 %in% rownames(normed_data)) {
+      cat("Skipping pair", gene1_symbol, "vs", gene2_symbol, "- gene(s) not in data\n")
+      next
+    }
+    
+    pair_name <- paste0(gene1_symbol, " vs ", gene2_symbol, "\n(", pathway, " - ", module_color, " module)")
+    
+    spf_df <- data.frame(
+      sample = spf_samples,
+      gene1 = as.numeric(normed_data[g1, spf_samples]),
+      gene2 = as.numeric(normed_data[g2, spf_samples]),
+      pair = pair_name,
+      pathway = pathway,
+      module = module_color,
+      stringsAsFactors = FALSE
+    )
+    
+    all_rows[[length(all_rows) + 1]] <- spf_df
+  }
+  
+  if(length(all_rows) == 0) {
+    cat("No valid gene pairs found for", tissue_prefix, "\n")
+    return(NULL)
+  }
+  
+  combined_df <- do.call(rbind, all_rows)
+  
+  # Calculate and print correlations to console
+  cat("\n=== SPF Correlation Analysis for", tissue_prefix, "===\n")
+  pairs <- unique(combined_df$pair)
+  
+  for (pair in pairs) {
+    cat("\n--- Gene Pair:", pair, "---\n")
+    subset_df <- combined_df[combined_df$pair == pair, ]
+    if (nrow(subset_df) > 1 && all(!is.na(subset_df$gene1)) && all(!is.na(subset_df$gene2))) {
+      correlation <- cor(subset_df$gene1, subset_df$gene2)
+      r2 <- summary(lm(gene2 ~ gene1, data = subset_df))$r.squared
+      cat(sprintf("SPF: r = %.3f, R² = %.3f\n", correlation, r2))
+    }
+  }
+  cat("\n")
+  
+  # Get the appropriate SPF color for this tissue
+  spf_color <- color_map[paste0(tissue_prefix, "_SPF")]
+  
+  p <- ggplot(combined_df, aes(x = gene1, y = gene2)) +
+    geom_point(size = 3, color = spf_color, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = spf_color, linewidth = 1) +
+    facet_wrap(~pair, scales = "free") +
+    labs(
+      title = paste(tissue_prefix, "SPF - Module Validation"),
+      x = "Gene 1 Expression",
+      y = "Gene 2 Expression"
+    ) +
+    common_theme
+  
+  return(p)
+}
+
+# Generate validation plots
+cat("Generating Ileum SPF module validation plots...\n")
+plot_ileum_spf <- make_spf_validation_scatter(
+  normed_data = ileum_normed_dat_corrected,
+  tissue_prefix = "Ileum",
+  gene_pairs_df = ileum_gene_pairs
+)
+
+cat("Generating Liver SPF module validation plots...\n")
+plot_liver_spf <- make_spf_validation_scatter(
+  normed_data = liver_normed_dat,
+  tissue_prefix = "Liver",
+  gene_pairs_df = liver_gene_pairs
+)
+
+# Print plots
+if(!is.null(plot_ileum_spf)) {
+  print(plot_ileum_spf)
+}
+
+if(!is.null(plot_liver_spf)) {
+  print(plot_liver_spf)
+}
+```
+
+
+

@@ -1,0 +1,1476 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Differential Gene Expression Analysis 
+
+This analysis is to look at differential expression between GF and SPF mice and then to look at recovery of gene expression in the minimally diverse MM12 mice.
+
+Having established that there is probably some sampling biases in the data we add PC1 and PC2 into the ileum model to control for unmeasured variation.
+
+
+```{r setup}
+
+knitr::opts_knit$set(root.dir = "/well/powrie/users/utu691/work/Diversity_Transcriptome/")
+
+```
+
+
+```{r Differential Expression Processing,  echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+# Generic functions are in the R/utils.R script
+source("/well/powrie/users/utu691/devel/Diversity_Transcriptome/R/utils.R")
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_plotting.R")
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_retrieval.R")
+source("~/work/mouse_rna_seq/deseq/R/PCA.R")
+
+# Load necessary libraries
+library(DESeq2)
+library(org.Mm.eg.db)
+library(EnhancedVolcano)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(enrichplot)
+library(biomaRt)
+library(pheatmap)
+library(fgsea)
+library(grid)
+library(data.table)
+library(kableExtra)
+library(OCMSutility)
+library(phyloseq)
+
+
+
+```
+
+```{r read in data, echo = FALSE, message = FALSE}
+
+# metadata
+metadata <- as.data.frame(readxl::read_xlsx(path = '/well/powrie/users/cqh100/work/mouse_rna_seq/metadata_fordeseq.xlsx'))
+
+## Subset for liver
+liver_metadata <- subset(metadata, tissue == 'liver')
+liver_metadata <- subset(liver_metadata, age == 'Young')
+liver_metadata <- subset(liver_metadata, group == 'Solo')
+liver_metadata$status <- as.factor(liver_metadata$status)
+rownames(liver_metadata) <- liver_metadata$sample_id
+colnames(liver_metadata)[1] <- 'sampleID'
+
+tx2gene <- read.csv("~/work/mouse_rna_seq/kallisto/combined/transcripts2genes.dir/transcripts2genes.tsv", header=TRUE, stringsAsFactors=FALSE, sep="\t")
+
+## liver -  tximport on data
+files <- list.files("/well/powrie/users/cqh100/work/mouse_rna_seq/liver_analysis/data/")[grep("*abundance.tsv",                                                                                            list.files("/well/powrie/users/cqh100/work/mouse_rna_seq/liver_analysis/data/"))]
+
+liver_names <- gsub("_abundance.tsv", "", files)
+
+files <- paste0("/well/powrie/users/cqh100/work/mouse_rna_seq/liver_analysis/data/", files)
+names(files) <- liver_names
+
+liver_txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
+liver_counts <- liver_txi$counts
+
+colnames(liver_counts) <- names(files)
+
+liver_metadata <- liver_metadata[colnames(liver_counts),]
+
+########### Ileum
+
+ileum_metadata <- read.table('/well/powrie/users/cqh100/work/mouse_rna_seq/splicing/ileum_metadata_with_PC_correction.tsv', sep = '\t', header = TRUE)
+
+ileum_metadata <- subset(ileum_metadata, age == 'Young')
+ileum_metadata <- subset(ileum_metadata, group == 'Solo')
+ileum_metadata$status <- as.factor(ileum_metadata$status)
+rownames(ileum_metadata) <- ileum_metadata$sample_id
+colnames(ileum_metadata)[1] <- 'sampleID'
+
+
+tx2gene <- read.csv("~/work/mouse_rna_seq/kallisto/combined/transcripts2genes.dir/transcripts2genes.tsv", header=TRUE, stringsAsFactors=FALSE, sep="\t")
+
+## ileum -  tximport on data
+files <- list.files("/well/powrie/users/cqh100/work/mouse_rna_seq/ileum_analysis/data/")[grep("*abundance.tsv",                                                                                            list.files("/well/powrie/users/cqh100/work/mouse_rna_seq/ileum_analysis/data/"))]
+
+ileum_names <- gsub("_abundance.tsv", "", files)
+
+files <- paste0("/well/powrie/users/cqh100/work/mouse_rna_seq/ileum_analysis/data/", files)
+names(files) <- ileum_names
+
+ileum_txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
+ileum_counts <- ileum_txi$counts
+colnames(ileum_counts) <- names(files)
+
+# Liver comparisons
+liver_txi_spf_vs_gf <- create_txi_subset(liver_txi, liver_metadata$status %in% c("SPF", "GF"))
+liver_txi_spf_vs_mm12 <- create_txi_subset(liver_txi, liver_metadata$status %in% c("SPF", "MM12"))
+liver_txi_gf_vs_mm12 <- create_txi_subset(liver_txi, liver_metadata$status %in% c("GF", "MM12"))
+
+# Ileum comparisons
+ileum_txi_spf_vs_gf <- create_txi_subset(ileum_txi, ileum_metadata$status %in% c("SPF", "GF"))
+ileum_txi_spf_vs_mm12 <- create_txi_subset(ileum_txi, ileum_metadata$status %in% c("SPF", "MM12"))
+ileum_txi_gf_vs_mm12 <- create_txi_subset(ileum_txi, ileum_metadata$status %in% c("GF", "MM12"))
+
+# Liver metadata comparisons
+liver_metadata_spf_vs_gf <- liver_metadata[liver_metadata$status %in% c("SPF", "GF"),]
+liver_metadata_spf_vs_mm12 <- liver_metadata[liver_metadata$status %in% c("SPF", "MM12"),]
+liver_metadata_gf_vs_mm12 <- liver_metadata[liver_metadata$status %in% c("GF", "MM12"),]
+
+# Ileum metadata comparisons
+ileum_metadata_spf_vs_gf <- ileum_metadata[ileum_metadata$status %in% c("SPF", "GF"),]
+ileum_metadata_spf_vs_mm12 <- ileum_metadata[ileum_metadata$status %in% c("SPF", "MM12"),]
+ileum_metadata_gf_vs_mm12 <- ileum_metadata[ileum_metadata$status %in% c("GF", "MM12"),]
+
+# normalised data
+liver_normed_dat <- readRDS("export.dir/liver_normed.Rds")
+ileum_normed_dat_correct <- readRDS("export.dir/ileum_normed_corrected.Rds")
+
+```
+
+```{r set up colours, echo = FALSE, message = FALSE}
+
+spectral <- brewer.pal(11, 'Spectral')
+group_colours <- c('liver_GF' = spectral[3],
+                   'liver_SPF' = spectral[1],
+                   'liver_MM12' = spectral[2],
+                   'ileum_GF' = spectral[9],
+                   'ileum_SPF' = spectral[11],
+                   'ileum_MM12' = spectral[10],
+                   'Liver_GF' = spectral[3],
+                   'Liver_SPF' = spectral[1],
+                   'Liver_MM12' = spectral[2],
+                   'Ileum_GF' = spectral[9],
+                   'Ileum_SPF' = spectral[11],
+                   'Ileum_MM12' = spectral[10],
+                   'liver_gf' = spectral[3],
+                   'liver_spf' = spectral[1],
+                   'liver_mm12' = spectral[2],
+                   'ileum_gf' = spectral[9],
+                   'ileum_spf' = spectral[11],
+                   'ileum_mm12' = spectral[10],
+                   'GF' = spectral[9],
+                   'MM12' = spectral[10],
+                   'SPF' = spectral[11])
+
+```
+
+
+
+```{r define comparisons, echo = FALSE, message = FALSE}
+
+# Define comparisons
+comparisons <- list(
+  list(name = "Liver_SPF_vs_GF", txi = liver_txi_spf_vs_gf, metadata = liver_metadata_spf_vs_gf, title = "Liver: SPF vs GF", design_formula = ~ status),
+  list(name = "Liver_SPF_vs_MM12", txi = liver_txi_spf_vs_mm12, metadata = liver_metadata_spf_vs_mm12, title = "Liver: SPF vs MM12", design_formula = ~ status),
+  list(name = "Liver_GF_vs_MM12", txi = liver_txi_gf_vs_mm12, metadata = liver_metadata_gf_vs_mm12, title = "Liver: GF vs MM12", design_formula = ~ status),
+  list(name = "Ileum_SPF_vs_GF", txi = ileum_txi_spf_vs_gf, metadata = ileum_metadata_spf_vs_gf, title = "Ileum: SPF vs GF", design_formula = ~ PC1 + PC2 + status),
+  list(name = "Ileum_SPF_vs_MM12", txi = ileum_txi_spf_vs_mm12, metadata = ileum_metadata_spf_vs_mm12, title = "Ileum: SPF vs MM12", design_formula = ~ PC1 + PC2 + status),
+  list(name = "Ileum_GF_vs_MM12", txi = ileum_txi_gf_vs_mm12, metadata = ileum_metadata_gf_vs_mm12, title = "Ileum: GF vs MM12", design_formula = ~ PC1 + PC2 + status)
+)
+
+# For offline mode (no internet required)
+results <- run_full_analysis(comparisons, offline = TRUE)
+saveRDS(results, file = "export.dir/results.Rds")
+
+```
+
+## PCA in each tissue across groups
+
+First we are exploring overall differences if the microbiome is not present i.e. GF vs. SPF.
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE, fig.height= 10, fig.width= 10}
+
+liver_pc <- runPCA(liver_normed_dat[, grep("^Liver(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", colnames(liver_normed_dat))], scale=FALSE)
+ileum_pc <- runPCA(ileum_normed_dat_corrected[, grep("^Ileum(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", colnames(ileum_normed_dat_corrected))], scale=FALSE)
+
+liver_colours <- group_colours[1:2]
+names(liver_colours) <- c("GF", "SPF")
+
+liver_PCA <- plotPrincipalComponentsCustom(
+  liver_pc, 
+  liver_metadata[grep("^Liver(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", liver_metadata$sampleID), ], 
+  group = 'status', 
+  colourby ='status')  + 
+  stat_ellipse() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = liver_colours)
+
+
+ileum_PCA <- plotPrincipalComponentsCustom(
+  ileum_pc, 
+  ileum_metadata[grep("^Ileum(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", ileum_metadata$sampleID), ], 
+  group = 'status', 
+  colourby ='status')  + 
+  stat_ellipse() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = group_colours)
+
+# save pca plots for figures
+if(!(dir.exists("export.dir"))){
+  dir.create("export.dir")
+}
+
+ggsave(ileum_PCA, file = "export.dir/ileum_spf_gf_pca.pdf", 
+       height = 2.5,
+       width = 2.5)
+
+ggsave(liver_PCA, file = "export.dir/liver_spf_gf_pca.pdf", 
+       height = 2.5,
+       width = 2.5)
+
+gridExtra::grid.arrange(ileum_PCA, liver_PCA, nrow = 1)
+
+```
+
+```{r tables set up, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 10, fig.width = 10}
+
+liver_combined <- get_combined_pathways(
+  results$Liver_SPF_vs_GF$significant_pathways, 
+  tissue_name = "Liver"
+)
+
+ileum_combined <- get_combined_pathways(
+  results$Ileum_SPF_vs_GF$significant_pathways, 
+  tissue_name = "Ileum"
+)
+
+# pathway plots?
+ileum_combined <- ileum_combined[order(ileum_combined$NES, decreasing = TRUE),]
+ileum_combined$pathway <- factor(ileum_combined$pathway,
+                                 levels = ileum_combined$pathway)
+ileum_top_pathways <- ggplot(ileum_combined, aes(x = pathway, y = NES, color = NES)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  coord_flip() +
+  scale_color_gradient(low = group_colours[["ileum_gf"]],
+                       high = group_colours[["ileum_spf"]]) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(axis.text.y = element_text(size = 6)) 
+
+# Liver
+liver_combined <- na.omit(liver_combined)
+liver_combined <- liver_combined[order(liver_combined$NES, decreasing = TRUE),]
+liver_combined$pathway <- factor(liver_combined$pathway,
+                                 levels = liver_combined$pathway)
+liver_top_pathways <- ggplot(liver_combined, aes(x = pathway, y = NES, color = NES)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  coord_flip() +
+  scale_color_gradient(low = group_colours[["liver_gf"]],
+                       high = group_colours[["liver_spf"]]) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(axis.text.y = element_text(size = 6)) 
+
+# Save pathway plots
+ggsave(ileum_top_pathways,
+       file = "export.dir/ileum_spf_gf_pathways.pdf",
+       height = 3,
+       width = 5)
+
+ggsave(liver_top_pathways,
+       file = "export.dir/liver_spf_gf_pathways.pdf",
+       height = 3,
+       width = 4.5)
+
+create_tissue_table <- function(pathways_df, title = NULL) {
+  selected_cols <- c("Enriched_in", "pathway", "NES", "padj", "size")
+  formatted <- pathways_df[, ..selected_cols]
+  setnames(formatted, "Enriched_in", "Enriched in")
+  formatted$NES <- round(formatted$NES, 3)
+  formatted$padj <- formatC(formatted$padj, format = "e", digits = 2)
+  formatted <- formatted[order(`Enriched in`)]
+
+  knitr::kable(formatted, caption = title, format = "pandoc")
+}
+
+grid.arrange(ileum_top_pathways, liver_top_pathways, nrow = 2)
+
+```
+
+## Genes of interest - ileum
+
+Here we focus on genes of interest that have come out of the Shen paper and that come up in our enrichment analysis - it should cover some of the immune/plasma cell development and activation and the lipid metabolic pathways.
+
+```{r genes of interest, echo = FALSE, message = FALSE}
+
+
+spf_gf_meta <- ileum_metadata[grep("^Ileum(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", ileum_metadata$sampleID), ]
+rownames(spf_gf_meta) <- spf_gf_meta$sampleID
+
+spf_gf_mat <- ileum_normed_dat_corrected[,spf_gf_meta$sampleID]
+            
+# get the GOIs
+plasma <- c(results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Igha"]],
+            results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Ighg2b"]])
+
+b_cell_activation <- c(results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Hspa1a"]],
+            results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Hspa1b"]])
+
+il7 <- c(results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Il7"]],
+            results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Il7r"]])
+
+apoas <- c(results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Apoa1"]],
+            results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Apoa4"]])
+
+transport <- c(results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Fabp1"]],
+            results$Ileum_SPF_vs_GF$symbol_to_ensembl[["Fabp2"]]) 
+
+spf_gf_gois <- spf_gf_mat[c(plasma, b_cell_activation, il7, apoas, transport),]
+rownames(spf_gf_gois) <- c("Igha", "Ighg2b", "Hspa1a", "Hspa1b", "Il7", "Il7r", "Apoa1", "Apoa4", "Fabp1", "Fabp2")
+
+for (i in 1:nrow(spf_gf_gois)){
+    featurebox(as.data.frame(spf_gf_gois),
+           metadata = spf_gf_meta,
+           features = rownames(spf_gf_gois)[i],
+           group_by = "status")  +
+    theme_classic() +
+    theme(legend.position = "none") +
+    scale_color_manual(values = group_colours) +
+    facet_wrap(~feature, scales = "free", ncol = 2)
+    ggsave(file = paste0("export.dir/", rownames(spf_gf_gois)[i], ".pdf"), height = 2.5, width = 2.5)
+}
+
+```
+
+
+## Genes of interest - liver
+
+Interesting that those that are downregulated in the liver are Slc i.e. MONOATOMIC ION TRANSPORT. Will look at these in more detail.
+
+```{r genes of interest, echo = FALSE, message = FALSE}
+
+spf_gf_meta_liver <- liver_metadata[grep("^Liver(1[0-5]|[1-9]|7[6-9]|8[0-9]|90)$", liver_metadata$sampleID), ]
+rownames(spf_gf_meta_liver) <- spf_gf_meta_liver$sampleID
+
+spf_gf_liver_mat <- liver_normed_dat[,spf_gf_meta_liver$sampleID]
+            
+# get the GOIs
+slcs <- unlist(liver_combined[10,]$leadingEdge)
+slcs <- slcs[grep("Slc", slcs)]
+slcs <- slcs[order(slcs)]
+slcs <- c(results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc41a2"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc41a3"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc26a1"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc26a8"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc20a2"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc26a1"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slc10a2"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Slco2b1"]]) 
+
+lipid_things <- c(results$Liver_SPF_vs_GF$symbol_to_ensembl[["Apoa1"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Apoa4"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Fgf21"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Acot1"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Cyp2c55"]],
+          results$Liver_SPF_vs_GF$symbol_to_ensembl[["Ppara"]])
+
+spf_gf_liver_gois <- spf_gf_liver_mat[c(slcs, lipid_things),]
+rownames(spf_gf_liver_gois) <- c("Slc41a2", "Slc41a3", "Slc26a1",
+                                 "Slc26a8", "Slc20a2", "Slc26a1",
+                                 "Slc10a2", "Slco2b1", "Apoa1",
+                                 "Apoa4", "Fgf21", "Acot1", "Cyp2c55",
+                                 "Ppara")
+
+
+for (i in 1:nrow(spf_gf_liver_gois)){
+    featurebox(as.data.frame(spf_gf_liver_gois),
+           metadata = spf_gf_meta_liver,
+           features = rownames(spf_gf_liver_gois)[i],
+           group_by = "status")  +
+    theme_classic() +
+    theme(legend.position = "none") +
+    scale_color_manual(values = liver_colours) +
+    facet_wrap(~feature, scales = "free", ncol = 2)
+    ggsave(file = paste0("export.dir/", rownames(spf_gf_liver_gois)[i], ".pdf"), height = 2.5, width = 2.5)
+}
+
+```
+
+## Recovery of gene expression in MM12
+
+Here we assess the ability of colonisation of a minimally diverse microbiome to recover gene expression patterns seen in SPF.
+
+### PCA
+
+```{r recovery, echo=FALSE, message=FALSE, warning=FALSE, fig.height= 10, fig.width= 10}
+
+liver_pc <- runPCA(liver_normed_dat, scale=FALSE)
+ileum_pc <- runPCA(ileum_normed_dat_corrected[, grep("^Ileum(1[0-5]|[1-9]|6[1-9]|7[0-5]|7[6-9]|8[0-9]|90)$", colnames(ileum_normed_dat_corrected))], scale=FALSE)
+
+
+liver_samples <- grep("^Liver(1[0-5]|[1-9]|6[1-9]|7[0-5]|7[6-9]|8[0-9]|90)$", liver_metadata$sampleID)
+liver_dist <- dist(t(liver_normed_dat[, liver_samples]))
+adonis_test_liver <- adonis2(liver_dist ~ status, data = liver_metadata[liver_samples, ])
+
+ileum_samples <- grep("^Ileum(1[0-5]|[1-9]|6[1-9]|7[0-5]|7[6-9]|8[0-9]|90)$", ileum_metadata$sampleID)
+ileum_dist <- dist(t(ileum_normed_dat_corrected[, ileum_samples]))
+adonis_test_ileum <- adonis2(ileum_dist ~ status, data = ileum_metadata[ileum_samples, ])
+
+liver_colours <- group_colours[1:3]
+names(liver_colours) <- c("GF", "SPF", "MM12")
+liver_PCA <- plotPrincipalComponentsCustom(
+  liver_pc, 
+  liver_metadata[liver_samples, ], 
+  group = 'status', 
+  colourby ='status') +
+  stat_ellipse() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = liver_colours)
+
+ileum_PCA <- plotPrincipalComponentsCustom(
+  ileum_pc, 
+  ileum_metadata[ileum_samples, ], 
+  group = 'status', 
+  colourby ='status') +
+  stat_ellipse() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = group_colours)
+
+ggsave(ileum_PCA, file = "export.dir/ileum_spf_gf_mm12_pca.pdf", 
+       height = 2.5,
+       width = 2.5)
+
+ggsave(liver_PCA, file = "export.dir/liver_spf_gf_mm12_pca.pdf", 
+       height = 2.5,
+       width = 2.5)  
+
+gridExtra::grid.arrange(ileum_PCA, liver_PCA, nrow = 1)
+```
+
+
+### Recovery numbers
+
+```{r recovery numbers and genes, echo = FALSE, message = FALSE}
+
+# Extract individual DESeq2 results from the results list
+liver_res_spf_vs_gf <- results[["Liver_SPF_vs_GF"]]$deseq
+liver_res_spf_vs_mm12 <- results[["Liver_SPF_vs_MM12"]]$deseq
+liver_res_gf_vs_mm12 <- results[["Liver_GF_vs_MM12"]]$deseq
+ileum_res_spf_vs_gf <- results[["Ileum_SPF_vs_GF"]]$deseq
+ileum_res_spf_vs_mm12 <- results[["Ileum_SPF_vs_MM12"]]$deseq
+ileum_res_gf_vs_mm12 <- results[["Ileum_GF_vs_MM12"]]$deseq
+
+
+# Extracting significantly upregulated genes
+liver_spf_vs_gf_up <- liver_res_spf_vs_gf$log2FoldChange < 0 & liver_res_spf_vs_gf$padj < 0.05
+liver_spf_vs_mm12_up <- liver_res_spf_vs_mm12$log2FoldChange < 0 & liver_res_spf_vs_mm12$padj < 0.05
+liver_gf_vs_mm12_up <- liver_res_gf_vs_mm12$log2FoldChange < 0 & liver_res_gf_vs_mm12$padj < 0.05
+ileum_spf_vs_gf_up <- ileum_res_spf_vs_gf$log2FoldChange < 0 & ileum_res_spf_vs_gf$padj < 0.05
+ileum_spf_vs_mm12_up <- ileum_res_spf_vs_mm12$log2FoldChange < 0 & ileum_res_spf_vs_mm12$padj < 0.05
+ileum_gf_vs_mm12_up <- ileum_res_gf_vs_mm12$log2FoldChange < 0 & ileum_res_gf_vs_mm12$padj < 0.05
+
+# Extracting significantly downregulated genes
+liver_spf_vs_gf_down <- liver_res_spf_vs_gf$log2FoldChange > 0 & liver_res_spf_vs_gf$padj < 0.05
+liver_spf_vs_mm12_down <- liver_res_spf_vs_mm12$log2FoldChange > 0 & liver_res_spf_vs_mm12$padj < 0.05
+liver_gf_vs_mm12_down <- liver_res_gf_vs_mm12$log2FoldChange > 0 & liver_res_gf_vs_mm12$padj < 0.05
+ileum_spf_vs_gf_down <- ileum_res_spf_vs_gf$log2FoldChange > 0 & ileum_res_spf_vs_gf$padj < 0.05
+ileum_spf_vs_mm12_down <- ileum_res_spf_vs_mm12$log2FoldChange > 0 & ileum_res_spf_vs_mm12$padj < 0.05
+ileum_gf_vs_mm12_down <- ileum_res_gf_vs_mm12$log2FoldChange > 0 & ileum_res_gf_vs_mm12$padj < 0.05
+
+
+# Extracting gene names or IDs
+liver_spf_vs_gf_up_genes <- rownames(liver_res_spf_vs_gf)[liver_spf_vs_gf_up]
+liver_spf_vs_mm12_up_genes <- rownames(liver_res_spf_vs_mm12)[liver_spf_vs_mm12_up]
+liver_gf_vs_mm12_up_genes <- rownames(liver_res_gf_vs_mm12)[liver_gf_vs_mm12_up]
+ileum_spf_vs_gf_up_genes <- rownames(ileum_res_spf_vs_gf)[ileum_spf_vs_gf_up]
+ileum_spf_vs_mm12_up_genes <- rownames(ileum_res_spf_vs_mm12)[ileum_spf_vs_mm12_up]
+ileum_gf_vs_mm12_up_genes <- rownames(ileum_res_gf_vs_mm12)[ileum_gf_vs_mm12_up]
+
+
+liver_spf_vs_gf_down_genes <- rownames(liver_res_spf_vs_gf)[liver_spf_vs_gf_down]
+liver_spf_vs_mm12_down_genes <- rownames(liver_res_spf_vs_mm12)[liver_spf_vs_mm12_down]
+liver_gf_vs_mm12_down_genes <- rownames(liver_res_gf_vs_mm12)[liver_gf_vs_mm12_down]
+ileum_spf_vs_gf_down_genes <- rownames(ileum_res_spf_vs_gf)[ileum_spf_vs_gf_down]
+ileum_spf_vs_mm12_down_genes <- rownames(ileum_res_spf_vs_mm12)[ileum_spf_vs_mm12_down]
+ileum_gf_vs_mm12_down_genes <- rownames(ileum_res_gf_vs_mm12)[ileum_gf_vs_mm12_down]
+
+liver_spf_vs_gf_up_genes <- data.frame(gene_name = liver_spf_vs_gf_up_genes)
+liver_spf_vs_mm12_up_genes <- data.frame(gene_name = liver_spf_vs_mm12_up_genes)
+liver_gf_vs_mm12_up_genes <- data.frame(gene_name = liver_gf_vs_mm12_up_genes)
+ileum_spf_vs_gf_up_genes <- data.frame(gene_name = ileum_spf_vs_gf_up_genes)
+ileum_spf_vs_mm12_up_genes <- data.frame(gene_name = ileum_spf_vs_mm12_up_genes)
+ileum_gf_vs_mm12_up_genes <- data.frame(gene_name = ileum_gf_vs_mm12_up_genes)
+
+liver_spf_vs_gf_down_genes <- data.frame(gene_name = liver_spf_vs_gf_down_genes)
+liver_spf_vs_mm12_down_genes <- data.frame(gene_name = liver_spf_vs_mm12_down_genes)
+liver_gf_vs_mm12_down_genes <- data.frame(gene_name = liver_gf_vs_mm12_down_genes)
+ileum_spf_vs_gf_down_genes <- data.frame(gene_name = ileum_spf_vs_gf_down_genes)
+ileum_spf_vs_mm12_down_genes <- data.frame(gene_name = ileum_spf_vs_mm12_down_genes)
+ileum_gf_vs_mm12_down_genes <- data.frame(gene_name = ileum_gf_vs_mm12_down_genes)
+
+
+# Inputs for liver
+liver_recovery_results <- compute_recovery(
+  up_genes = liver_spf_vs_gf_up_genes,
+  down_genes = liver_spf_vs_gf_down_genes,
+  mm12_up_genes = liver_spf_vs_mm12_up_genes,
+  mm12_down_genes = liver_spf_vs_mm12_down_genes,
+  tissue = "Liver"
+)
+
+# Inputs for ileum
+ileum_recovery_results <- compute_recovery(
+  up_genes = ileum_spf_vs_gf_up_genes,
+  down_genes = ileum_spf_vs_gf_down_genes,
+  mm12_up_genes = ileum_spf_vs_mm12_up_genes,
+  mm12_down_genes = ileum_spf_vs_mm12_down_genes,
+  tissue = "Ileum"
+)
+
+# Add a new column 'regulation' to each data frame
+liver_recovery_results$up$regulation <- "Up"
+liver_recovery_results$down$regulation <- "Down"
+ileum_recovery_results$up$regulation <- "Up"
+ileum_recovery_results$down$regulation <- "Down"
+
+# Combine liver and ileum results into one data frame
+combined_recovery_results <- rbind(
+  liver_recovery_results$up,
+  liver_recovery_results$down,
+  ileum_recovery_results$up,
+  ileum_recovery_results$down
+)
+
+
+# a simple plot for the paper
+ggplot(combined_recovery_results, aes(x = group, y = proportion, fill = recovery_status)) +
+  geom_bar(stat="identity", color = "black") +
+  facet_wrap(~tissue, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(values = c("snow2", "grey")) +
+  theme(legend.position = "none")
+ggsave(file = "export.dir/recovery_barplot.pdf", height = 2.5, width = 4)
+
+```
+
+### A simple heatmap to display the extent of recovery 
+
+```{r recovery heatmap, echo = FALSE, message = FALSE}
+
+# Inputs for ileum
+ileum_recovery_genes <- get_recovery_genes(
+  up_genes = ileum_spf_vs_gf_up_genes,
+  down_genes = ileum_spf_vs_gf_down_genes,
+  mm12_up_genes = ileum_spf_vs_mm12_up_genes,
+  mm12_down_genes = ileum_spf_vs_mm12_down_genes,
+  tissue = "Ileum"
+)
+
+# get metadatas
+ileum_spf_gf_mm12_meta <- metadata[metadata$age == "Young" & 
+                                     metadata$tissue == "ileum" &
+                                     metadata$group == "Solo",]
+liver_spf_gf_mm12_meta <- metadata[metadata$age == "Young" & 
+                                     metadata$tissue == "liver" &
+                                     metadata$group == "Solo",]
+
+# get expression data
+ileum_exprs <- ileum_normed_dat_corrected[,ileum_spf_gf_mm12_meta$sample_id]
+
+# aggregate on symbols
+geneid2genename <- data.frame(gene_id = ileum_res_gf_vs_mm12$gene_id,
+                              gene_name = ileum_res_gf_vs_mm12$gene_name)
+rownames(geneid2genename) <- geneid2genename$gene_id
+to_agg <- geneid2genename[rownames(ileum_exprs),]
+
+ileum_exprs <- aggregate(ileum_exprs, by = list(to_agg$gene_name), FUN = "mean") %>%
+  tibble::column_to_rownames(var = "Group.1")
+
+ileum_exprs_recovery <- ileum_exprs[unlist(ileum_recovery_genes, use.names = FALSE),]
+
+# Annotations
+row_anno <- data.frame(gene = rownames(ileum_exprs_recovery),
+                       status = NA)
+row_anno$status <- ifelse(rownames(ileum_exprs_recovery) %in% ileum_recovery_genes$up_recovered | rownames(ileum_exprs_recovery) %in% ileum_recovery_genes$down_recovered,
+                          "Recovered",
+                          "Not_recovered")
+row_annot <- rowAnnotation(status = row_anno$status,
+                           col = list(status = c("Recovered" = "grey",
+                                                 "Not_recovered" = "snow2")))
+
+column_anno <- HeatmapAnnotation(group = ileum_spf_gf_mm12_meta$status,
+                                 col = list(group = c("SPF" = "#5E4FA2",
+                                                      "MM12" = "#3288BD",
+                                                      "GF" = "#66C2A5")))
+# scale data
+ileum_exprs_recovery <- Seurat::ScaleData(ileum_exprs_recovery)
+
+pdf("ileum_heatmap_recovery.pdf", height = 10, width = 8)
+Heatmap(ileum_exprs_recovery[,ileum_spf_gf_mm12_meta$sample_id],
+        top_annotation = column_anno,
+        column_split = ileum_spf_gf_mm12_meta$status,
+        use_raster = FALSE,
+        right_annotation = row_annot,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        cluster_columns = FALSE,
+        row_split  = row_anno$status)
+dev.off()
+```
+
+### liver
+
+```{r recovery heatmap liver, echo = FALSE, message = FALSE}
+
+# Inputs for liver
+liver_recovery_genes <- get_recovery_genes(
+  up_genes = liver_spf_vs_gf_up_genes,
+  down_genes = liver_spf_vs_gf_down_genes,
+  mm12_up_genes = liver_spf_vs_mm12_up_genes,
+  mm12_down_genes = liver_spf_vs_mm12_down_genes,
+  tissue = "Liver"
+)
+
+# get metadatas
+liver_spf_gf_mm12_meta <- metadata[metadata$age == "Young" & 
+                                     metadata$tissue == "liver" &
+                                     metadata$group == "Solo",]
+
+# get expression data
+liver_exprs <- liver_normed_dat[,liver_spf_gf_mm12_meta$sample_id]
+
+# aggregate on symbols
+geneid2genename <- data.frame(gene_id = liver_res_gf_vs_mm12$gene_id,
+                              gene_name = liver_res_gf_vs_mm12$gene_name)
+rownames(geneid2genename) <- geneid2genename$gene_id
+to_agg <- geneid2genename[rownames(liver_exprs),]
+
+liver_exprs <- na.omit(aggregate(liver_exprs, by = list(to_agg$gene_name), FUN = "mean")) %>%
+  tibble::column_to_rownames(var = "Group.1")
+
+liver_exprs_recovery <- liver_exprs[unlist(liver_recovery_genes, use.names = FALSE),]
+
+# Annotations
+row_anno <- data.frame(gene = rownames(liver_exprs_recovery),
+                       status = NA)
+row_anno$status <- ifelse(rownames(liver_exprs_recovery) %in% liver_recovery_genes$up_recovered | rownames(liver_exprs_recovery) %in% liver_recovery_genes$down_recovered,
+                          "Recovered",
+                          "Not_recovered")
+row_annot <- rowAnnotation(status = row_anno$status,
+                           col = list(status = c("Recovered" = "grey",
+                                                 "Not_recovered" = "snow2")))
+
+column_anno <- HeatmapAnnotation(group = liver_spf_gf_mm12_meta$status,
+                                 col = list(group = c("SPF" = "#9E0142",
+                                                      "MM12" = "#D53E4F",
+                                                      "GF" = "#F46D43")))
+# scale data
+liver_exprs_recovery <- Seurat::ScaleData(liver_exprs_recovery)
+
+pdf("liver_heatmap_recovery.pdf", height = 10, width = 8)
+Heatmap(liver_exprs_recovery[,liver_spf_gf_mm12_meta$sample_id],
+        top_annotation = column_anno,
+        column_split = liver_spf_gf_mm12_meta$status,
+        use_raster = FALSE,
+        right_annotation = row_annot,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        cluster_columns = FALSE,
+        row_split  = row_anno$status)
+dev.off()
+```
+
+### Varying recovery across samples
+
+We already know that some of the mice have different microbiomes in the MM12 i.e. lactobacillus high. Is this what is impacting on the ability to recover i.e. there are differences between mice. Is it cage effects?
+
+#### Ileum
+
+```{r varying recovery, echo = FALSE, message = FALSE}
+
+ileum_recovered <- c(unlist(ileum_recovery_genes$up_recovered),
+                     unlist(ileum_recovery_genes$down_recovered))
+
+ileum_notrecovered <- c(unlist(ileum_recovery_genes$up_not_recovered),
+                        unlist(ileum_recovery_genes$down_not_recovered))
+
+expression_pattern_recovered <- as.data.frame(colMeans(na.omit(ileum_exprs[ileum_recovered,])))
+expression_pattern_notrecovered <- as.data.frame(colMeans(na.omit(ileum_exprs[ileum_notrecovered,])))
+colnames(expression_pattern_recovered) <- "Recovered"
+colnames(expression_pattern_notrecovered) <- "Not recovered"
+
+expression_pattern_ileum <- pivot_longer(bind_cols(expression_pattern_recovered,
+                                        expression_pattern_notrecovered),
+                                        cols = everything())
+
+ggplot(expression_pattern_ileum, aes(x = value, fill = name)) +
+  geom_histogram(color = "black") +
+  theme_classic() +
+  scale_fill_manual(values = c("snow2", "grey")) +
+  theme(legend.position = "none")
+```
+
+#### liver
+
+
+```{r varying recovery liver, echo = FALSE, message = FALSE}
+
+liver_recovered <- c(unlist(liver_recovery_genes$up_recovered),
+                     unlist(liver_recovery_genes$down_recovered))
+
+liver_notrecovered <- c(unlist(liver_recovery_genes$up_not_recovered),
+                        unlist(liver_recovery_genes$down_not_recovered))
+
+expression_pattern_recovered_l <- as.data.frame(colMeans(na.omit(liver_exprs[liver_recovered,])))
+expression_pattern_notrecovered_l <- as.data.frame(colMeans(na.omit(liver_exprs[liver_notrecovered,])))
+colnames(expression_pattern_recovered_l) <- "Recovered"
+colnames(expression_pattern_notrecovered_l) <- "Not recovered"
+
+expression_pattern_liver <- pivot_longer(bind_cols(expression_pattern_recovered_l,
+                                        expression_pattern_notrecovered_l),
+                                        cols = everything())
+
+ggplot(expression_pattern_liver, aes(x = value, fill = name)) +
+  geom_histogram(color = "black") +
+  theme_classic() +
+  scale_fill_manual(values = c("snow2", "grey")) +
+  theme(legend.position = "none")
+
+```
+
+The genes that are recovered are definitely more low in expression than the ones that are not - what this means is unclear but is a pattern across both the liver and the ileum.
+
+
+## MM12 communities
+
+I want to check the MM12 communities and how they look look in terms of gene expression between those that have high lactobacillus versus low lactobacillus.
+
+
+```{r mm12 community composition, echo = FALSE, message = FALSE}
+
+
+qPCR <- read.csv('/well/powrie/users/cqh100/work/generated_data/qPCR/mm12.csv', header = TRUE, row.names = 1)
+names(qPCR) <- gsub("\\.", " ", names(qPCR))
+qPCR[] <- lapply(qPCR, function(x) as.numeric(as.character(x)))
+
+strain_mapping <- c(
+  I46 = "Clostridium innocuum I46",
+  I48 = "Bacteroides caecimuris I48",
+  I49 = "Limosilactobacillus reuteri I49",
+  KB1 = "Enterococcus faecalis KB1",
+  KB18 = "Acutalibacter muris KB18",
+  YL2 = "Bifidobacterium animalis subsp. animalis YL2",
+  YL27 = "Muribaculum intestinale YL27",
+  YL31 = "Flavonifractor plautii YL31",
+  YL32 = "Clostridium clostridioforme YL32",
+  YL44 = "Akkermansia muciniphila YL44",
+  YL45 = "Turicimonas muris YL45",
+  YL58 = "Blautia coccoides YL58"
+)
+
+ileum_metadata <- read.table(
+  '/well/powrie/users/cqh100/work/mouse_rna_seq/splicing/ileum_metadata_with_PC_correction.tsv',
+  sep = '\t', header = TRUE
+)
+colnames(ileum_metadata)[1] <- 'sampleID'
+ileum_metadata <- subset(ileum_metadata, tissue == 'ileum' & age == 'Young' & group == 'Solo')
+rownames(ileum_metadata) <- ileum_metadata$sampleID
+ileum_metadata$status <- as.factor(ileum_metadata$status)
+ileum_metadata_mm12 <- subset(ileum_metadata, status == 'MM12' & rownames(ileum_metadata) != 'Ileum61')
+ileum_metadata_mm12$Sample <- paste("Sample", seq(1, nrow(ileum_metadata_mm12)))
+rownames(ileum_metadata_mm12) <- ileum_metadata_mm12$Sample
+
+qPCR <- qPCR[match(rownames(ileum_metadata_mm12), colnames(qPCR))]
+qPCR_rel <- sweep(qPCR, 2, colSums(qPCR), "/") * 100
+
+mm12_colors <- get_palette(n = 12, palette = c("Paired", "Dark2"))
+names(mm12_colors) <- names(strain_mapping)
+plt <- OCMSutility::stacked_barchart(qPCR_rel, top_n = 12) 
+dat_to_plot <- plt[[1]]
+dat_to_plot <- dat_to_plot[order(dat_to_plot$Taxon, decreasing=TRUE),]
+dat_to_plot <- dat_to_plot[order(dat_to_plot$Relab, decreasing=TRUE),]
+
+dat_to_plot$Sample <- factor(dat_to_plot$Sample, levels = unique(dat_to_plot$Sample))
+
+ggplot(dat_to_plot, aes(x = Sample, y = Relab, fill = Taxon)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_manual(values = mm12_colors)
+ggsave("export.dir/stacked_bar_mm12.pdf", height = 2.5, width = 4)
+
+
+phyobj <- otu_table(qPCR_rel, taxa_are_rows = TRUE)
+
+ileum_metadata_mm12$Limosilactobacillus_reuteri_I49 <- unlist(qPCR_rel["I49",])
+sample_table <- sample_data(ileum_metadata_mm12)
+phyobj <- merge_phyloseq(phyobj, sample_table)
+
+ord_obj <- ordinate(phyobj, method = "PCoA", distance = "bray")
+
+plot_ordination(phyobj, ord_obj, color = "Limosilactobacillus_reuteri_I49") +
+  theme_classic() +
+  scale_color_gradient(low = "snow2", high = blues9[8]) +
+  geom_point(size = 3) +
+  theme(legend.position = "none")
+ggsave("export.dir/mm12_ordination.pdf", height = 2.5, width = 2.5)
+
+```
+
+## Testing for gene expression differences in L. reuteri dominant
+
+Here we look at ileum and liver just in MM12 mice but split them by l.reuteri dominance (>50%).
+
+```{r l reuteri dominance, echo = FALSE, message = FALSE}
+
+ileum_metadata_mm12$reuteri_status <- ifelse(ileum_metadata_mm12$Limosilactobacillus_reuteri_I49 > 50, "Major", "Minor")
+
+ileum_txi_mm12 <- create_txi_subset(ileum_txi, ileum_metadata_mm12$sampleID)
+rownames(ileum_metadata_mm12) <- ileum_metadata_mm12$sampleID
+dds_mm12 <- DESeqDataSetFromTximport(ileum_txi_mm12,
+                                     ileum_metadata_mm12,
+                                     design = ~PC1 + PC2 + reuteri_status)
+colData(dds_mm12)$reuteri_status <- relevel(colData(dds_mm12)$reuteri_status, ref = "Minor")
+#dds_mm12 <- dds_mm12[rowSums(dds_mm12 > 10) >= 5,]
+dds_mm12 <- DESeq(dds_mm12)
+res_mm12 <- lfcShrink(dds_mm12,
+                      contrast = c("reuteri_status", "Major", "Minor"),
+                      type = "normal")
+res_mm12 <- as.data.frame(res_mm12[order(res_mm12$padj, decreasing = FALSE),])
+
+# Add gene names
+geneid2genename <- read.csv("/well/powrie/shared/music_examples/mm39_ensembl107_gene_id2gene_name.tsv",
+                            header=TRUE,
+                            stringsAsFactors=FALSE,
+                            sep="\t")
+rownames(geneid2genename) <- geneid2genename$ensemble_gene_id
+colnames(geneid2genename) <- c("gene_id", "gene_name")
+res_mm12$gene_name <- geneid2genename[rownames(res_mm12),]$gene_name
+
+knitr::kable(head(as.data.frame(res_mm12), n = 10))
+
+vst_mm12 <- as.data.frame(assay(vst(dds_mm12)))
+featurebox(vst_mm12, ileum_metadata_mm12, features = "ENSMUSG00000037868", group_by = "reuteri_status")
+
+```
+
+
+### Correlation in lipid metabolic pathways
+
+It is of interest and also previously shown that there are opposing effects of triglyceride metabolic pathways between the liver and the ileum in gf mice. As we have a lot of mice we can actually look at how different genes correlate between these tissues. Examples would include those involved in lipid assembly and transport and TAG synthesis.
+
+```{r cor lipid pathways across tissues, echo = FALSE, message = FALSE}
+
+ileum_lipid <- unlist(ileum_combined[13,]$leadingEdge)
+
+liver_lipid <- unlist(liver_combined[5,]$leadingEdge)
+ileum <- spf_gf_mat
+liver <- spf_gf_liver_mat
+ileum_ids <- ileum_res_spf_vs_gf$gene_id[ileum_res_spf_vs_gf$gene_name %in% ileum_lipid]
+liver_ids <- liver_res_spf_vs_gf$gene_id[liver_res_spf_vs_gf$gene_name %in% liver_lipid]
+
+# Just in SPF
+ileum_spf <- spf_gf_meta$sampleID[spf_gf_meta$status == "SPF"]
+liver_spf <- spf_gf_meta_liver$sampleID[spf_gf_meta_liver$status == "SPF"]
+
+ileum <- ileum[ileum_ids, ileum_spf]
+liver <- liver[liver_ids, liver_spf]
+
+rownames(ileum_res_spf_vs_gf) <- ileum_res_spf_vs_gf$gene_id
+
+rownames(ileum) <- paste0("Ileum_", ileum_res_spf_vs_gf[rownames(ileum),]$gene_name) 
+rownames(liver) <- paste0("Liver_", ileum_res_spf_vs_gf[rownames(liver),]$gene_name)
+
+colnames(liver) <- colnames(ileum)
+
+ileum <- ileum[grep("NA", rownames(ileum), invert = TRUE),]
+liver <- liver[grep("NA", rownames(liver),invert = TRUE),]
+both_lipid <- bind_rows(as.data.frame(ileum), 
+                        as.data.frame(liver))
+
+  
+cors_lipid <- as.data.frame(cor(t(both_lipid)))
+cors_lipid_long <- OCMSutility::sym_mat2df(cors_lipid)
+
+x <- cors_lipid_long[abs(cors_lipid_long$value) > 0.8,]
+
+cors_lipid_strong <- cors_lipid[c(x$X1, x$X2),c(x$X1, x$X2)]
+
+# interesting corrrelations between tissues
+interesting_cors <- data.frame(Ileum_Acadvl = unlist(ileum["Ileum_Acadvl",]),
+                               Liver_Agps = unlist(liver["Liver_Agps",]),
+                               Ileum_Acox1 = unlist(ileum["Ileum_Acox1",]),
+                               Liver_Crot = unlist(liver["Liver_Crot",]))
+
+ggplot(interesting_cors, aes(x = Ileum_Acox1, y = Liver_Crot)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+
+
+# annotate with whether they are ileum 
+# or liver
+library(ComplexHeatmap)
+column_anno <- HeatmapAnnotation("Tissue" = gsub("(_.*)", "", colnames(cors_lipid_strong)),
+                          col = list("Tissue" = c("Ileum" = "#5E4FA2",
+                                                 "Liver" = "#9E0142")))
+row_anno <- rowAnnotation("Tissue" = gsub("(_.*)", "", rownames(cors_lipid_strong)),
+                          col = list("Tissue" = c("Ileum" = "#5E4FA2",
+                                                 "Liver" = "#9E0142")))
+
+Heatmap(cors_lipid_strong,
+                        show_row_names = FALSE,
+                        show_column_names = FALSE,
+                        top_annotation = column_anno,
+                        right_annotation = row_anno)
+
+
+```
+
+
+
+### Compare liver and ileum fold changes
+
+This is a quick look to see how the genes that change in GF in the ileum compare to genes that change in the liver
+
+```{r scatter folds, echo = FALSE, message = FALSE}
+
+liver_res_spf_vs_gf <- results[["Liver_SPF_vs_GF"]]$deseq
+ileum_res_spf_vs_gf <- results[["Ileum_SPF_vs_GF"]]$deseq
+
+# get common genes 
+genes <- intersect(liver_res_spf_vs_gf$gene_name, ileum_res_spf_vs_gf$gene_name)
+
+gene_symbol_map <- geneid2genename
+colnames(gene_symbol_map) <- c("ensembl_id", "gene_name")
+rownames(gene_symbol_map) <- gene_symbol_map$ensembl_id
+
+to_compare <- data.frame(gene_name = genes,
+                         liver_fold = liver_res_spf_vs_gf[genes,]$log2FoldChange,
+                         ileum_fold = ileum_res_spf_vs_gf[genes,]$log2FoldChange)
+to_compare$label <- ifelse(to_compare$liver_fold > 1 & to_compare$ileum_fold > 1,
+                           to_compare$gene_name,
+                           NA)
+to_compare$label <- ifelse(to_compare$liver_fold < -1 & to_compare$ileum_fold < -1,
+                           to_compare$gene_name,
+                           to_compare$label)
+
+ggplot(to_compare, aes(x = ileum_fold, y = liver_fold)) +
+  geom_point(size = 0.3) +
+  theme_classic() +
+  geom_hline(yintercept = c(-1,1), linetype = "dashed") +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  ggrepel::geom_text_repel(label = to_compare$label)
+
+```
+
+
+## Simple pathway analysis of recovered or not recovered
+
+### Ileum
+
+```{r pathways recovery status, echo = FALSE, message = FALSE}
+
+pathways <- fgsea::gmtPathways( "/well/powrie/shared/mm_msigdb/m5.go.v2023.1.Mm.symbols.gmt.txt")
+pathways <- pathways[grep("GOBP", names(pathways))]
+
+pathway_fold_enrichment <- function(res, nsig, pathways, universe){
+  
+  # iterate over pathways and estimate fold changes
+  for (i in 1:nrow(res)){
+    pathway <- res[i, "pathway"]
+    pathway_set <- unlist(pathways[[pathway]])
+    background_overlap <- length(intersect(universe, pathway_set))
+    overlap <- res[i, "overlap"]
+    fe <- (overlap/nsig)/(background_overlap/length(universe))
+    res[i, "foldEnrichment"] <- fe
+  }
+  return(res)
+}
+
+ileum_up_recovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       ileum_recovery_genes$up_recovered,
+                                       universe = unlist(ileum_recovery_genes, use.names = FALSE))),
+                                       length(ileum_recovery_genes$up_recovered),
+                                       pathways,
+                                       unlist(ileum_recovery_genes, use.names = FALSE))
+
+ileum_down_recovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       ileum_recovery_genes$down_recovered,
+                                       universe = unlist(ileum_recovery_genes, use.names = FALSE))),
+                                       length(ileum_recovery_genes$down_recovered),
+                                       pathways,
+                                       unlist(ileum_recovery_genes, use.names = FALSE))
+
+ileum_up_notrecovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       ileum_recovery_genes$up_not_recovered,
+                                       universe = unlist(ileum_recovery_genes, use.names = FALSE))),
+                                       length(ileum_recovery_genes$up_not_recovered),
+                                       pathways,
+                                       unlist(ileum_recovery_genes, use.names = FALSE))                                 
+
+ileum_down_notrecovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       ileum_recovery_genes$down_not_recovered,
+                                       universe = unlist(ileum_recovery_genes, use.names = FALSE))),
+                                       length(ileum_recovery_genes$down_not_recovered),
+                                       pathways,
+                                       unlist(ileum_recovery_genes, use.names = FALSE))      
+
+# order
+ileum_up_recovered_path <- ileum_up_recovered_path[ileum_up_recovered_path$padj < 0.05 & order(ileum_up_recovered_path$foldEnrichment, decreasing = TRUE),]
+
+ileum_down_recovered_path <- ileum_down_recovered_path[ileum_down_recovered_path$padj < 0.05 & order(ileum_down_recovered_path$foldEnrichment, decreasing = TRUE),]
+
+ileum_up_notrecovered_path <- ileum_up_notrecovered_path[ileum_up_notrecovered_path$padj < 0.05 & order(ileum_up_notrecovered_path$foldEnrichment, decreasing = TRUE),]
+
+ileum_down_notrecovered_path <- ileum_down_notrecovered_path[ileum_down_notrecovered_path$padj < 0.05 & order(ileum_down_notrecovered_path$foldEnrichment, decreasing = TRUE),]
+
+# take top one from each
+to_plot_pathways <- data.frame(pathway = c(ileum_up_recovered_path$pathway[1],
+                                           ileum_down_recovered_path$pathway[1],
+                                           ileum_up_notrecovered_path$pathway[1],
+                                           ileum_down_notrecovered_path$pathway[1]),
+                               FoldEnrichment = c(ileum_up_recovered_path$foldEnrichment[1],
+                                           ileum_down_recovered_path$foldEnrichment[1],
+                                           ileum_up_notrecovered_path$foldEnrichment[1],
+                                           ileum_down_notrecovered_path$foldEnrichment[1]),
+                               Status = c("Up recovered",
+                                          "Down recovered",
+                                          "Up not recovered",
+                                          "Down not recovered"))
+to_plot_pathways$pathway <- factor(to_plot_pathways$pathway, levels = to_plot_pathways$pathway)
+ggplot(to_plot_pathways, aes(x = pathway, y = FoldEnrichment, fill = Status)) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  coord_flip() +
+  ylim(c(0,3)) +
+  scale_fill_manual(values = c("grey", "snow2", "grey", "snow2")) +
+  theme(legend.position = "none")
+  
+ggsave("export.dir/Ileum_recovery_pathways_barplot.pdf", height = 2.5, width = 5)
+```
+
+
+### Ileum GOIs from pathways
+
+```{r ileum gois from pathways, echo = FALSE, message = FALSE}
+
+# get the matrix
+ileum_exprs <- ileum_normed_dat_corrected
+to_agg <- geneid2genename[rownames(ileum_exprs),]$gene_name
+ileum_exprs <- na.omit(aggregate(ileum_exprs, by = list(to_agg), FUN = "mean")) %>%
+  tibble::column_to_rownames(var = "Group.1")
+ileum_exprs <- ileum_exprs[,ileum_spf_gf_mm12_meta$sample_id]
+rownames(ileum_spf_gf_mm12_meta) <- ileum_spf_gf_mm12_meta$sample_id
+
+ileum_rrna_gois <- c("Ddx1", "Hnrnpa1", "Hnrnpk")
+ileum_cell_activation <- c("Il7r", "Cd80", "Cd86", "Il1b")
+ileum_lipid <- c("Fabp1", "Fabp2", "Crot", "Gpat3", "Crat", "Ldlr", "Acox1")
+ileum_immune <- c("Igha", "Cd3d", "Ifit1", "Ccl6", "Cd14", "Sting1", "Ifit2", "Ifit3", "Cx3cr1")
+
+ileum_gois <- c(ileum_rrna_gois, ileum_cell_activation, ileum_lipid, ileum_immune)
+
+for (i in 1:length(ileum_gois)){
+    featurebox(as.data.frame(ileum_exprs),
+           metadata = ileum_spf_gf_mm12_meta,
+           features = ileum_gois[i],
+           group_by = "status")  +
+    theme_classic() +
+    theme(legend.position = "none") +
+    scale_color_manual(values = group_colours) +
+    facet_wrap(~feature, scales = "free", ncol = 2)
+    ggsave(file = paste0("export.dir/", ileum_gois[i], ".pdf"), height = 2.5, width = 2.5)
+}
+
+
+```
+
+
+
+### In liver
+
+```{r pathways recovery status liver, echo = FALSE, message = FALSE}
+
+
+liver_up_recovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       liver_recovery_genes$up_recovered,
+                                       universe = unlist(liver_recovery_genes, use.names = FALSE))),
+                                       length(liver_recovery_genes$up_recovered),
+                                       pathways,
+                                       unlist(liver_recovery_genes, use.names = FALSE))
+
+liver_down_recovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       liver_recovery_genes$down_recovered,
+                                       universe = unlist(liver_recovery_genes, use.names = FALSE))),
+                                       length(liver_recovery_genes$down_recovered),
+                                       pathways,
+                                       unlist(liver_recovery_genes, use.names = FALSE))
+
+liver_up_notrecovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       liver_recovery_genes$up_not_recovered,
+                                       universe = unlist(liver_recovery_genes, use.names = FALSE))),
+                                       length(liver_recovery_genes$up_not_recovered),
+                                       pathways,
+                                       unlist(liver_recovery_genes, use.names = FALSE))                                 
+
+liver_down_notrecovered_path <- pathway_fold_enrichment(as.data.frame(fgsea::fora(pathways,
+                                       liver_recovery_genes$down_not_recovered,
+                                       universe = unlist(liver_recovery_genes, use.names = FALSE))),
+                                       length(liver_recovery_genes$down_not_recovered),
+                                       pathways,
+                                       unlist(liver_recovery_genes, use.names = FALSE))      
+
+# order
+liver_up_recovered_path <- liver_up_recovered_path[liver_up_recovered_path$padj < 0.05 & order(liver_up_recovered_path$foldEnrichment, decreasing = TRUE),]
+
+liver_down_recovered_path <- liver_down_recovered_path[liver_down_recovered_path$padj < 0.05 & order(liver_down_recovered_path$foldEnrichment, decreasing = TRUE),]
+
+liver_up_notrecovered_path <- liver_up_notrecovered_path[liver_up_notrecovered_path$padj < 0.05 & order(liver_up_notrecovered_path$foldEnrichment, decreasing = TRUE),]
+
+liver_down_notrecovered_path <- liver_down_notrecovered_path[liver_down_notrecovered_path$padj < 0.05 & order(liver_down_notrecovered_path$foldEnrichment, decreasing = TRUE),]
+
+# take top one from each
+to_plot_pathways <- data.frame(pathway = c(liver_up_recovered_path$pathway[1],
+                                           liver_down_recovered_path$pathway[1],
+                                           liver_up_notrecovered_path$pathway[1],
+                                           liver_down_notrecovered_path$pathway[1]),
+                               FoldEnrichment = c(liver_up_recovered_path$foldEnrichment[1],
+                                           liver_down_recovered_path$foldEnrichment[1],
+                                           liver_up_notrecovered_path$foldEnrichment[1],
+                                           liver_down_notrecovered_path$foldEnrichment[1]),
+                               Status = c("Up recovered",
+                                          "Down recovered",
+                                          "Up not recovered",
+                                          "Down not recovered"))
+to_plot_pathways$pathway <- factor(to_plot_pathways$pathway, levels = to_plot_pathways$pathway)
+ggplot(na.omit(to_plot_pathways), aes(x = pathway, y = FoldEnrichment, fill = Status)) +
+  geom_bar(stat="identity") +
+  theme_classic() +
+  coord_flip() +
+  ylim(c(0,4)) +
+  scale_fill_manual(values = c("grey", "snow2", "grey", "snow2")) +
+  theme(legend.position = "none")
+  
+ggsave("export.dir/Liver_recovery_pathways_barplot.pdf", height = 2.5, width = 5)
+```
+
+
+### Liver GOIs from pathways
+
+```{r liver gois from pathways, echo = FALSE, message = FALSE}
+
+# get the matrix
+liver_exprs <- liver_normed_dat
+to_agg <- geneid2genename[rownames(liver_exprs),]$gene_name
+liver_exprs <- na.omit(aggregate(liver_exprs, by = list(to_agg), FUN = "mean")) %>%
+  tibble::column_to_rownames(var = "Group.1")
+liver_exprs <- liver_exprs[,liver_spf_gf_mm12_meta$sample_id]
+rownames(liver_spf_gf_mm12_meta) <- liver_spf_gf_mm12_meta$sample_id
+
+liver_mono <- unlist(liver_up_notrecovered_path[1,]$overlapGenes)
+liver_fatty <- unlist(liver_down_recovered_path[1,]$overlapGenes)
+liver_up_recovered <- c("Mnt", "Uhrf1", "Snapin", "Cyp17a1", "Ap1b1", "Amdhd1")
+liver_down_notrecovered <- c("Apoa4", "Cyp2b10", "Cyp2c29", "Cyp2c55", "Nr1i2")
+liver_gois <- c(liver_mono,
+                liver_fatty,
+                liver_up_recovered,
+                liver_down_notrecovered)
+
+for (i in 1:length(liver_gois)){
+    featurebox(as.data.frame(liver_exprs),
+           metadata = liver_spf_gf_mm12_meta,
+           features = liver_gois[i],
+           group_by = "status")  +
+    theme_classic() +
+    theme(legend.position = "none") +
+    scale_color_manual(values = liver_colours) +
+    facet_wrap(~feature, scales = "free", ncol = 2)
+    ggsave(file = paste0("export.dir/", liver_gois[i], ".pdf"), height = 2.5, width = 2.5)
+}
+
+```
+
+
+## Liver visualisation of results
+
+I think we want to finish with the observation that lipid metabolic processes are also affected in the liver and therefore may be influenced by ileum or other intestinal segments in GF vs SPF. Whether or not the MM12 can recover these pathways in the liver is also of interest given that Fabl1 etc were not recovered in the ileum. It could be quite a nice message that this minial community does not recover ileum-liver communication to a full extent based on lipid metabolic processes.
+
+## The numbers
+
+```{r numbers up and down liver, echo = FALSE, message = FALSE}
+
+liver_mm12 <- results$Liver_SPF_vs_MM12$deseq
+liver_gf <- results$Liver_SPF_vs_GF$deseq
+
+up_mm12 <- subset(liver_mm12, subset = padj < 0.05 & log2FoldChange < 0)
+down_mm12 <- subset(liver_mm12, subset = padj < 0.05 & log2FoldChange > 0)
+
+up_gf <- subset(liver_gf, subset = padj < 0.05 & log2FoldChange < 0)
+down_gf <- subset(liver_gf, subset = padj < 0.05 & log2FoldChange > 0)
+
+numbers_liver <- data.frame(up_mm12 = nrow(up_mm12),
+                            down_mm12 = nrow(down_mm12),
+                            up_gf = nrow(up_gf),
+                            down_gf = nrow(down_gf))
+
+knitr::kable(numbers_liver)
+
+```
+
+
+## Volcano plots
+
+```{r volcano plots, echo = FALSE, message = FALSE}
+
+# GF
+liver_gf$padj_adj <- ifelse(-log10(liver_gf$padj) > 50, 50, -log10(liver_gf$padj))
+liver_gf$sig <- ifelse(liver_gf$padj < 0.05, "a", "b")
+
+# labels
+top_10_gf <- liver_gf[order(liver_gf$padj, decreasing = FALSE),]$gene_name[1:10]
+liver_gf$label <- ifelse(liver_gf$gene_name %in% top_10_gf, liver_gf$gene_name, NA)
+ggplot(liver_gf, aes(x = log2FoldChange, y = padj_adj, color = sig)) +
+         geom_point() +
+         theme_classic() +
+  scale_color_manual(values = c("#F46D43", "snow2")) +
+  geom_vline(xintercept = c(-1,0,1), linetype = "dashed") +
+  ggrepel::geom_text_repel(label = liver_gf$label, color = "black") +
+  theme(legend.position = "none")
+ggsave(file = "export.dir/liver_gf_volcano.pdf", height = 2.5, width = 2.5)
+
+
+# MM12
+liver_mm12$padj_adj <- ifelse(-log10(liver_mm12$padj) > 50, 50, -log10(liver_mm12$padj))
+liver_mm12$sig <- ifelse(liver_mm12$padj < 0.05, "a", "b")
+
+# labels
+top_10_mm12 <- liver_mm12[order(liver_mm12$padj, decreasing = FALSE),]$gene_name[1:10]
+liver_mm12$label <- ifelse(liver_mm12$gene_name %in% top_10_mm12, liver_mm12$gene_name, NA)
+ggplot(liver_mm12, aes(x = log2FoldChange, y = padj_adj, color = sig)) +
+         geom_point() +
+         theme_classic() +
+  scale_color_manual(values = c("#D53E4F", "snow2")) +
+  geom_vline(xintercept = c(-1,0,1), linetype = "dashed") +
+  ggrepel::geom_text_repel(label = liver_mm12$label, color = "black") +
+  theme(legend.position = "none")
+ggsave(file = "export.dir/liver_mm12_volcano.pdf", height = 2.5, width = 2.5)
+
+```
+
+## Pathways in GF vs SPF
+
+```{r liver GF pathways, echo = FALSE, message = FALSE}
+
+gf_vs_spf <- as.data.frame(results$Liver_SPF_vs_GF$gsea)
+gf_vs_spf <- gf_vs_spf[order(gf_vs_spf$padj, decreasing = FALSE),]
+gf_vs_spf_sig <- gf_vs_spf$pathway[gf_vs_spf$padj < 0.05]
+```
+
+
+## Pathways in MM12 vs SPF
+
+```{r liver mm12 pathways, echo = FALSE, message = FALSE}
+
+mm12_vs_spf <- as.data.frame(results$Liver_SPF_vs_MM12$gsea)
+mm12_vs_spf <- mm12_vs_spf[order(mm12_vs_spf$padj, decreasing = FALSE),]
+mm12_vs_spf_sig <- mm12_vs_spf$pathway[mm12_vs_spf$padj < 0.05]
+```
+
+
+## Venn of the pathways
+
+Below are the overlapping pathways between GF vs SPF and MM12 vs SPF.
+
+```{r venn pathways, echo = FALSE, message = FALSE}
+
+to_venn_pathways_liver <- list(GF = gf_vs_spf_sig,
+                               MM12 = mm12_vs_spf_sig)
+
+venn_liver <- VennDiagram::venn.diagram(to_venn_pathways_liver,
+                          file = NULL,
+                          fill = c("#F46D43", "#D53E4F"),
+                          alpha = 0.6)
+pdf("export.dir/venn_liver_gf_mm12.pdf", height = 2.5, width = 4)
+grid.draw(venn_liver)
+dev.off()
+```
+
+
+## Overlapping pathways
+
+```{r overlapping liver, echo = FALSE, message = FALSE}
+
+intersect(gf_vs_spf_sig, mm12_vs_spf_sig)
+
+
+```
+
+Response to lipid is in there and so we will look at those genes.
+
+## Response to lipid GO:BP
+
+```{r response to lipid, echo = FALSE, message = FALSE}
+
+liver_lipid_gois <- intersect(unlist(gf_vs_spf[gf_vs_spf$pathway == "GOBP_RESPONSE_TO_LIPID",]$leadingEdge), unlist(mm12_vs_spf[mm12_vs_spf$pathway == "GOBP_RESPONSE_TO_LIPID",]$leadingEdge))
+
+liver_lipid_gois <- c("Cebpb", "Ddit4", "Ppargc1a", "Ppargc1b", "Ldlr", "Rorc", "Rora", "Ar", "Cyp7a1", "Cyp7b1")
+
+  
+
+liver_plots <- list()
+for (i in 1:length(liver_lipid_gois)){
+    gene <- liver_lipid_gois[i]
+    p <- featurebox(liver_exprs,
+               metadata = liver_metadata[colnames(liver_exprs),],
+               features = gene,
+               group_by = "status") +
+      scale_color_manual(values = liver_colours) +
+      theme_classic() +
+      theme(legend.position = "none")
+      liver_plots[[i]] <- p
+      ggsave(file = paste0("export.dir/", gene, ".pdf"), height = 2.5, width = 2.5)
+}
+
+gridExtra::grid.arrange(grobs = liver_plots, ncol = 3)
+```
+
+
+## Get significance tables for these genes
+
+```{r sig tables, echo = FALSE, message = FALSE}
+
+results$Liver_SPF_vs_GF$deseq[liver_lipid_gois,]
+results$Liver_SPF_vs_MM12$deseq[liver_lipid_gois,]
+
+```
+
+## Correlation between lipid metabolism in ileum and lipid response in the liver
+
+Here we create a metagene (pathway metagene) for ileum (GOBP lipid metabolism) and liver (GOBP response to lipid) to see if we get any correlation both between and within groups of mice.
+
+```{r lipid things, echo = FALSE, message = FALSE}
+
+lipid_metabolic_process <- unlist(results$Ileum_SPF_vs_GF$gsea[results$Ileum_SPF_vs_GF$gsea$pathway == "GOBP_LIPID_METABOLIC_PROCESS",]$leadingEdge)
+
+#lipid_metabolic_process <- unlist(pathways["GOBP_LIPID_METABOLIC_PROCESS"], use.names = FALSE)
+response_to_lipid <-  unlist(results$Liver_SPF_vs_GF$gsea[results$Liver_SPF_vs_GF$gsea$pathway == "GOBP_RESPONSE_TO_LIPID",]$leadingEdge)
+  
+lipid_metabolic_process_ileum <- colMeans(ileum_exprs[lipid_metabolic_process,], na.rm = TRUE)
+response_to_lipid_liver <- colMeans(liver_exprs[response_to_lipid,], na.rm = TRUE)
+
+names(lipid_metabolic_process_ileum) <- gsub("Ileum", "Sample", names(lipid_metabolic_process_ileum))
+names(response_to_lipid_liver) <- gsub("Liver", "Sample", names(response_to_lipid_liver))
+
+samples <- names(lipid_metabolic_process_ileum)
+
+to_cor_lipid <- data.frame(sample = samples,
+                           Liver_Metagene = response_to_lipid_liver[samples],
+                           Ileum_Metagene = lipid_metabolic_process_ileum[samples],
+                           group = ileum_metadata[colnames(ileum_exprs),]$status)
+
+p_cor <- ggplot(to_cor_lipid, aes(x = Ileum_Metagene, y = Liver_Metagene, color = group, fill = group)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c(blues9[3], blues9[5], blues9[7])) +
+  scale_fill_manual(values = c(blues9[3], blues9[5], blues9[7])) +
+  stat_smooth(data = to_cor_lipid, aes(x = Ileum_Metagene, y = Liver_Metagene), inherit.aes = FALSE, method = "lm", linetype = "dashed", color = "black", se = FALSE) +
+  stat_cor(data = to_cor_lipid, aes(x = Ileum_Metagene, y = Liver_Metagene), inherit.aes = FALSE) 
+
+ggsave(p_cor + theme(legend.position = "none"), 
+       file = "export.dir/lipid_cors_across_tissues.pdf",
+       height = 2.5, width = 2.5)
+
+```
+
+There is no correlation within groups so rather than quantitative changes it looks more like physiological shifts due to microbiome background.
+
+
+## Supplemental material
+
+Here I write out some tables which will be put in figshare as supplementary information. It includes differential expression results and GO BP results from GSEA.
+
+```{r supplemental write, echo = FALSE, message = FALSE}
+
+de_gf_spf <- as.data.frame(results$Ileum_SPF_vs_GF$deseq)
+de_mm12_spf <- as.data.frame(results$Ileum_SPF_vs_MM12$deseq)
+de_gf_mm12 <- as.data.frame(results$Ileum_GF_vs_MM12$deseq)
+
+write.table(de_gf_spf,
+            file = "export.dir/deseq_ileum_gf_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+write.table(de_mm12_spf,
+            file = "export.dir/deseq_ileum_mm12_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+write.table(de_gf_mm12,
+            file = "export.dir/deseq_ileum_gf_vs_mm12.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+# GO results
+de_gf_spf_go <- as.data.frame(results$Ileum_SPF_vs_GF$gsea)
+de_mm12_spf_go <- as.data.frame(results$Ileum_SPF_vs_MM12$gsea)
+de_gf_mm12_go <- as.data.frame(results$Ileum_GF_vs_MM12$gsea)
+
+
+for (i in 1:nrow(de_gf_spf_go)){
+  de_gf_spf_go[i,]$leadingEdge <- paste(unlist(de_gf_spf_go[i,]$leadingEdge), collapse = ", ")[[1]]
+}
+de_gf_spf_go$leadingEdge <- unlist(de_gf_spf_go$leadingEdge)
+
+
+for (i in 1:nrow(de_mm12_spf_go)){
+  de_mm12_spf_go[i,]$leadingEdge <- paste(unlist(de_mm12_spf_go[i,]$leadingEdge), collapse = ", ")[[1]]
+}
+de_mm12_spf_go$leadingEdge <- unlist(de_mm12_spf_go$leadingEdge)
+
+for (i in 1:nrow(de_gf_mm12_go)){
+  de_gf_mm12_go[i,]$leadingEdge <- paste(unlist(de_gf_mm12_go[i,]$leadingEdge), collapse = ", ")[[1]]
+}
+de_gf_mm12_go$leadingEdge <- unlist(de_gf_mm12_go$leadingEdge)
+
+
+
+write.table(de_gf_spf_go,
+            file = "export.dir/gsea_ileum_gf_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+write.table(de_mm12_spf_go,
+            file = "export.dir/gsea_ileum_mm12_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+write.table(de_gf_mm12_go,
+            file = "export.dir/gsea_ileum_gf_vs_mm12.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+
+de_liver_gf_spf <- as.data.frame(results$Liver_SPF_vs_GF$deseq)
+de_liver_mm12_spf <- as.data.frame(results$Liver_SPF_vs_MM12$deseq)
+
+write.table(de_liver_gf_spf,
+            file = "export.dir/deseq_liver_gf_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+write.table(de_liver_mm12_spf,
+            file = "export.dir/deseq_liver_mm12_vs_spf.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+```
+
+
+
+
+
+
